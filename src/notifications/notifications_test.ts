@@ -111,6 +111,12 @@ Deno.test("send: gives up after maxAttempts with the last error, and retry sends
   await assertRejects(() => t.n.retry(again.id), Error, "Only failed");
 });
 
+Deno.test("send: maxAttempts per send overrides the registry's (a caller under a deadline asks for 1)", async () => {
+  const t = await setup({ failures: 1 });
+  const once = await t.n.send({ provider: "fake", to: "1", text: "x" }, { maxAttempts: 1 });
+  assertEquals([once.status, once.attempts, t.fake.sent.length], ["failed", 1, 0]);
+});
+
 Deno.test("send: refuses a message without text or media, and an unknown provider", async () => {
   const t = await setup();
   await assertRejects(() => t.n.send({ provider: "fake", to: "1" }), Error, "text or media");
