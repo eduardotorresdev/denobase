@@ -255,3 +255,56 @@ Deno.test("whatsapp contacts: events fold into the book and a partial update kee
     notify: "Ana B",
   });
 });
+
+Deno.test("email: sends through app.mailer and logs it like any send (channel email, subject as text)", async () => {
+  const cs = [superusers, ...notificationCollections, nt_users];
+  const app = createApp({ db: await dbWith(cs), mailer: new MemoryMailer(), collections: cs, adminUiDir: false });
+  const n = await register(app, { providers: () => [], email: true, backoffMs: () => 0 });
+  const mailer = app.mailer as MemoryMailer;
+  const row = await n.send({
+    provider: "email",
+    to: "ana@x.io",
+    subject: "Contrato para assinatura",
+    html: "<p>link privado</p>",
+    replyTo: "vera@x.io",
+  });
+  assertEquals([row.status, row.channel, row.to, row.text, row.attempts], [
+    "sent",
+    "email",
+    "ana@x.io",
+    "Contrato para assinatura",
+    1,
+  ]);
+  // The body is not logged: it may carry a private link.
+  assert(!JSON.stringify(row).includes("link privado"));
+  assertEquals(mailer.sent.map((m) => [m.to, m.subject, m.html, m.replyTo]), [
+    ["ana@x.io", "Contrato para assinatura", "<p>link privado</p>", "vera@x.io"],
+  ]);
+  assertEquals(n.list().find((p) => p.id === "email"), {
+    id: "email",
+    channels: ["email"],
+    status: { state: "connected" },
+  });
+
+  // A mailer that refuses: retried, then failed with its reason; the body is not kept, so retry() refuses.
+  mailer.send = () => Promise.reject(new Error("422 invalid to"));
+  const failed = await n.send({ provider: "email", to: "x@x.io", subject: "S", html: "<p>b</p>" });
+  assertEquals([failed.status, failed.attempts, failed.error], ["failed", 3, "422 invalid to"]);
+  await assertRejects(() => n.retry(failed.id), Error, "not kept");
+
+  // An e-mail without subject, or with media, is refused before anything is logged.
+  const antes = await app.store.collection(notifications).count();
+  await assertRejects(() => n.send({ provider: "email", to: "a@x.io", html: "<p>b</p>" }), Error, "subject");
+  await assertRejects(
+    () =>
+      n.send({ provider: "email", to: "a@x.io", subject: "S", media: { kind: "image", url: "https://x.io/a.png" } }),
+    Error,
+    "media",
+  );
+  assertEquals(await app.store.collection(notifications).count(), antes);
+});
+
+Deno.test("email: off unless asked; the default registry has no e-mail provider", async () => {
+  const t = await setup();
+  assertEquals(t.n.list().map((p) => p.id), ["fake"]);
+});

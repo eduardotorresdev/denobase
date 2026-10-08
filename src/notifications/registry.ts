@@ -107,12 +107,18 @@ export class Notifications {
     if (!parsed.success) throw badRequest(parsed.error.issues[0]?.message ?? "Invalid message.");
     const msg = parsed.data;
     const provider = this.get(msg.provider);
+    const email = provider.channels[0] === "email";
+    if (email && (!msg.subject?.trim() || msg.media)) {
+      throw badRequest("An e-mail needs a subject and takes no media.");
+    }
     const media = msg.media ? { ...msg.media, data: undefined } : null;
     const row = await this.store.collection(notifications).create({
       provider: provider.id,
       channel: provider.channels[0],
       to: msg.to,
-      text: msg.text ?? "",
+      // An e-mail logs its subject: the body is HTML (and may carry a private link), so it is not kept, like inline
+      // media; retry() therefore cannot resend one.
+      text: email ? msg.subject! : msg.text ?? "",
       media,
       status: "queued",
       attempts: 0,
@@ -124,6 +130,7 @@ export class Notifications {
   async retry(id: string): Promise<NotificationRecord> {
     const row = await this.store.collection(notifications).get(id);
     if (row.status !== "failed") throw badRequest("Only failed notifications can be retried.");
+    if (row.channel === "email") throw badRequest("An e-mail's body is not kept; send it again.");
     const media = row.media as NotificationMessage["media"] | null;
     if (media && !media.url) throw badRequest("Media sent inline is not kept; send it again.");
     const msg: NotificationMessage = {

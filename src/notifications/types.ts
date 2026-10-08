@@ -1,7 +1,7 @@
 import { z } from "zod";
 
-/** A delivery medium a provider serves; WhatsApp is the only one today. */
-export type Channel = "whatsapp";
+/** A delivery medium a provider serves. */
+export type Channel = "whatsapp" | "email";
 
 /** A media attachment: exactly one of a base64 payload (data) or a url the provider fetches itself. */
 export interface Media {
@@ -24,9 +24,13 @@ export const mediaSchema: z.ZodType<Media> = z.object({
 /** A message to send: text, media or both, optionally quoting an earlier one and mentioning jids. */
 export interface NotificationMessage {
   provider: string;
-  /** Provider address: a phone number ("5511999999999") or a WhatsApp jid (user or group). */
+  /** Provider address: a phone number ("5511999999999"), a WhatsApp jid (user or group) or an e-mail address. */
   to: string;
   text?: string;
+  /** E-mail only: the subject (required there), the HTML body and the Reply-To address. */
+  subject?: string;
+  html?: string;
+  replyTo?: string;
   media?: Media;
   /** Quotes an earlier message (a reply); id is the provider's id of the quoted message. */
   reply?: { id: string; author?: string; text?: string };
@@ -36,9 +40,13 @@ export interface NotificationMessage {
 
 export const messageSchema: z.ZodType<NotificationMessage> = z.object({
   provider: z.string().min(1),
-  /** Provider address: a phone number ("5511999999999") or a WhatsApp jid (user or group). */
+  /** Provider address: a phone number ("5511999999999"), a WhatsApp jid (user or group) or an e-mail address. */
   to: z.string().min(1),
   text: z.string().optional(),
+  /** E-mail only: the subject (required there), the HTML body and the Reply-To address. */
+  subject: z.string().optional(),
+  html: z.string().optional(),
+  replyTo: z.string().optional(),
   media: mediaSchema.optional(),
   /** Quotes an earlier message (a reply); id is the provider's id of the quoted message. */
   reply: z.object({
@@ -50,7 +58,7 @@ export const messageSchema: z.ZodType<NotificationMessage> = z.object({
   }).optional(),
   /** Jids the text mentions; the text itself already carries each "@<user>". */
   mentions: z.array(z.string().min(1)).optional(),
-}).refine((m) => !!m.text || !!m.media, { message: "message needs text or media" });
+}).refine((m) => !!m.text || !!m.media || !!m.html, { message: "message needs text or media (or html, by e-mail)" });
 
 export interface SendResult {
   /** The provider's id of the sent message; receipts refer back to it. */

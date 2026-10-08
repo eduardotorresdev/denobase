@@ -6,6 +6,7 @@ import { type NotificationAuthorize, notificationRoutes } from "./http.ts";
 import { Notifications, type NotificationsOptions } from "./registry.ts";
 import type { Provider } from "./types.ts";
 import { WhatsAppWebProvider } from "./whatsapp/provider.ts";
+import { EmailProvider } from "./email/provider.ts";
 
 export * from "./types.ts";
 export * from "./collections.ts";
@@ -27,6 +28,7 @@ export {
   WhatsAppWebProvider,
 } from "./whatsapp/provider.ts";
 export { type StoreAuthState, useStoreAuthState } from "./whatsapp/auth_state.ts";
+export { EMAIL, EmailProvider } from "./email/provider.ts";
 
 /** Native collections of the module; the consumer registers them (registerCollections) before migrate create. */
 export const collections: CollectionConfig[] = notificationCollections;
@@ -34,6 +36,8 @@ export const collections: CollectionConfig[] = notificationCollections;
 export interface RegisterNotificationsOptions extends NotificationsOptions {
   /** Providers built over the app's store; default is WhatsApp Web alone. */
   providers?: (store: Store) => Provider[];
+  /** Also registers an EmailProvider (id `email`) over app.mailer, so e-mails go through the same send log. */
+  email?: boolean;
   /** Who may call /api/notifications/*; default superusers only. */
   authorize?: NotificationAuthorize;
 }
@@ -48,5 +52,6 @@ export async function register(app: App, opts: RegisterNotificationsOptions = {}
   notificationRoutes(app.http, app.store, n, opts.authorize);
   const providers = opts.providers?.(app.store) ?? [new WhatsAppWebProvider(app.store)];
   for (const p of providers) await n.register(p);
+  if (opts.email) await n.register(new EmailProvider(() => app.mailer));
   return n;
 }
