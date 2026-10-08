@@ -21,6 +21,7 @@ import { PROGRESS_OP } from "./files/tasks/migrate.ts";
 import { loadSettings, resolveSettings, type Settings, type SettingsPatch } from "./settings/mod.ts";
 import { bundledUi, diskUi } from "./http/ui_source.ts";
 import { McpHost } from "./mcp/host.ts";
+import { PathRedactor } from "./http/redact_path.ts";
 import { JobRunner } from "./jobs/runner.ts";
 import { onExternalCommit, syncExternalCommits } from "./core/coherence.ts";
 import { shareRecordEvents } from "./engine/bus.ts";
@@ -83,6 +84,11 @@ export interface App {
   readonly fetch: Hono<AppEnv>["fetch"];
   /** MCP extension API: tools, resources and prompts the consumer adds next to the built-ins. */
   readonly mcp: Mcp;
+  /**
+   * Registers a route pattern whose `:param` segments carry a credential (a webhook secret in its URL): the activity
+   * log and the request span store those segments as `***`. Call it next to the route it protects.
+   */
+  redactPath(pattern: string): void;
   /** Registers fn to run on terminate() (PB OnTerminate): close sockets, flush queues. */
   onTerminate(fn: () => unknown): void;
   /** Runs every onTerminate fn once, in reverse registration order; a failing fn does not stop the others. */
@@ -155,6 +161,7 @@ export function createApp(opts: AppOptions): App {
   const reloadAutoBackups = autoBackups(cron, backups, settings);
   onSettingsChange.push(reloadAutoBackups);
   const mcp = new McpHost(opts.mcp);
+  const redactor = new PathRedactor();
   mcp.useTracer({
     span: (name, attrs, fn) => tracer.span(name, attrs as Attrs, () => fn()),
     query: ({ limit, filter }) => Promise.resolve(traces.listTraces({ filter, perPage: limit })),
@@ -180,6 +187,7 @@ export function createApp(opts: AppOptions): App {
       ? diskUi(opts.adminUiDir)
       : bundledUi(),
     mcp,
+    redactor,
   };
   const http = createHttp(ctx);
   const onTerminate: (() => unknown)[] = [];
@@ -217,6 +225,7 @@ export function createApp(opts: AppOptions): App {
     http,
     fetch: http.fetch,
     mcp,
+    redactPath: (pattern) => redactor.add(pattern),
     onTerminate: (fn) => void onTerminate.push(fn),
     terminate,
   };

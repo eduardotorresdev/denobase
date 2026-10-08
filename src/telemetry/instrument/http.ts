@@ -49,7 +49,12 @@ function routeOf(c: Context): string | undefined {
  */
 export function tracingMiddleware(
   tracer: Tracer,
-  opts: { authId?: () => boolean; user?: (c: Context) => { id: string } | null | undefined } = {},
+  opts: {
+    authId?: () => boolean;
+    user?: (c: Context) => { id: string } | null | undefined;
+    /** Masks the segments of a path that carry a credential (app.redactPath) before url.path is stored. */
+    redactPath?: (path: string) => string;
+  } = {},
 ): MiddlewareHandler {
   return async (c, next) => {
     if (!tracer.enabled || !isTraced(c.req.path)) return await next();
@@ -62,7 +67,7 @@ export function tracingMiddleware(
       parent: tracer.settings().trustTraceparent ? parseTraceparent(c.req.header("traceparent")) : null,
       attributes: {
         "http.request.method": method,
-        "url.path": url.pathname,
+        "url.path": opts.redactPath ? opts.redactPath(url.pathname) : url.pathname,
         "url.query": redactQuery(url.search),
         "user_agent.original": c.req.header("user-agent")?.slice(0, 500),
       },

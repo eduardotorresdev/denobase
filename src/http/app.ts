@@ -36,6 +36,7 @@ import type { Tracer } from "../telemetry/tracer.ts";
 import { tracingMiddleware } from "../telemetry/instrument/http.ts";
 import { traced } from "../telemetry/instrument/child.ts";
 import { traceRoutes } from "./traces.ts";
+import type { PathRedactor } from "./redact_path.ts";
 
 export type AppEnv = { Variables: { user: AuthUser | null } };
 
@@ -61,6 +62,8 @@ export interface Ctx {
   adminUi?: UiSource;
   /** The app's MCP (POST /api/mcp); its registry is app.mcp. */
   mcp: McpHost;
+  /** Paths with a credential in a segment, masked in the activity log and the request span (app.redactPath). */
+  redactor: PathRedactor;
 }
 
 /** PB accepts both "Bearer x" and a raw token in Authorization. */
@@ -82,7 +85,11 @@ export function createHttp(ctx: Ctx): Hono<AppEnv> {
   // First, so the activity log and every handler run inside the request's root span.
   app.use(
     "*",
-    tracingMiddleware(ctx.tracer, { authId: () => ctx.settings.logs.logAuthId, user: (c) => c.get("user") }),
+    tracingMiddleware(ctx.tracer, {
+      authId: () => ctx.settings.logs.logAuthId,
+      user: (c) => c.get("user"),
+      redactPath: (path) => ctx.redactor.redact(path),
+    }),
   );
   // PB's CORS middleware: every origin by default (`--origins`), so a front on another port or host can call the
   // API; DENOBASE_ORIGINS narrows it to a comma-separated list. Preflights answer here, before auth and routes.

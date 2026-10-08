@@ -42,7 +42,8 @@ export function activityLogger(ctx: Ctx): MiddlewareHandler<AppEnv> {
     const u = new URL(c.req.url);
     // /oauth/* carries state, challenges and client ids in the query: masked like the traces' url.query.
     const search = u.pathname.startsWith("/oauth/") && u.search ? `?${redactQuery(u.search) ?? ""}` : u.search;
-    const url = cut(u.pathname + search, 3000);
+    // A path that carries a credential (app.redactPath) is stored with that segment masked.
+    const url = cut(ctx.redactor.redact(u.pathname) + search, 3000);
     const method = cut(c.req.method.toUpperCase(), 50);
     const user = c.get("user");
     const data: Record<string, unknown> = { type: "request", execTime: performance.now() - started };
