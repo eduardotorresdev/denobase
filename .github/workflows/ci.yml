@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: 2.9.7
+      - name: Format
+        run: deno fmt --check
+      - name: Lint
+        run: deno lint
+      - name: Type check
+        run: deno task check
+      - name: Test
+        run: deno task test
+      - name: Publish dry run
+        run: deno publish --dry-run

@@ -1,0 +1,27 @@
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: 2.9.7
+      - name: Tag matches deno.json version
+        run: |
+          version="$(deno eval 'console.log(JSON.parse(Deno.readTextFileSync("deno.json")).version)')"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match deno.json version ${version}" >&2
+            exit 1
+          fi
+      - name: Publish to JSR
+        run: deno publish
