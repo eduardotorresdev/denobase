@@ -220,3 +220,42 @@ Deno.test("files serve like Go's http.ServeContent: ranges, 416 and conditionals
   const fresh = await get({ Range: "bytes=0-1", "If-Range": lastModified });
   assertEquals([fresh.status, await fresh.text()], [206, "01"]);
 });
+
+/** Spool dirs left in the temp dir; the request scope must remove its own whatever the outcome. */
+async function spoolDirs(): Promise<number> {
+  const tmp = Deno.env.get("TMPDIR") || "/tmp";
+  let n = 0;
+  for await (const e of Deno.readDir(tmp)) if (e.name.startsWith("denobase-upload-")) n++;
+  return n;
+}
+
+Deno.test("uploads spool to disk and the spool goes after success, validation error and batch rollback", async () => {
+  const t = await setup();
+  const base = "/api/collections/fl_docs/records";
+  const before = await spoolDirs();
+  let r = await t.send("POST", base, t.fd([["anexos", txt("ok.txt", "0123456789")]]));
+  assertEquals(r.status, 200);
+  const stored = await t.storage.get(`${collectionId(fl_docs)}/${r.json.id}/${r.json.anexos[0]}`);
+  assertEquals(await new Response(stored!.body).text(), "0123456789");
+  // One byte over maxSize: PB's error and message, from the size counted while the spool kept only maxSize.
+  r = await t.send("POST", base, t.fd([["anexos", txt("grande.txt", "x".repeat(100_000))]]));
+  assertEquals(r.status, 400);
+  assertEquals(r.json.data.anexos, {
+    code: "validation_file_size_limit",
+    message: "Failed to upload grande.txt - the maximum allowed file size is 10 bytes.",
+  });
+  const form = new FormData();
+  form.append(
+    "@jsonPayload",
+    JSON.stringify({
+      requests: [
+        { method: "POST", url: base, body: { titulo: "a" } },
+        { method: "POST", url: base, body: { nota: "x" } },
+      ],
+    }),
+  );
+  form.append("requests.0.anexos", txt("a.txt"));
+  r = await t.send("POST", "/api/batch", form);
+  assertEquals(r.status, 400);
+  assertEquals(await spoolDirs(), before);
+});

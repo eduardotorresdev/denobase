@@ -19,6 +19,7 @@ import type { Cron } from "../cron/mod.ts";
 import { cronRoutes } from "./crons.ts";
 import type { Backups } from "../backups/mod.ts";
 import { backupRoutes } from "./backups.ts";
+import { withSpoolScope } from "../files/spool.ts";
 import { collectionRoutes } from "./collections.ts";
 import type { UiSource } from "./ui_source.ts";
 import { adminUiRoutes } from "./admin_ui.ts";
@@ -88,6 +89,8 @@ export function createHttp(ctx: Ctx): Hono<AppEnv> {
     await next();
   });
   app.use("*", activityLogger(ctx));
+  // Multipart uploads spool to temp files for the request; they go when it ends, stored or not.
+  app.use("*", (_c, next) => withSpoolScope(next));
   // Invalid tokens resolve to guest like PB; endpoints that need auth answer 401 themselves. So does a token minted
   // for another audience (app.mcp.token): it only opens /api/mcp.
   app.use("*", async (c, next) => {

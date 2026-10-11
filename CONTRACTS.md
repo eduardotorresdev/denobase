@@ -69,6 +69,11 @@ Frozen signatures; stubs throw `notImplemented`. Change a signature only with th
 - Migrations never touch data; `up` and `genesis` refuse "multiple heads". Snapshots keep indexes sorted by name (order
   carries no meaning), and `addIndex` keeps a partial index's `where`.
 - Uploads are stored inside the write's tx; files a write drops (or a deleted record's dir) go only after commit.
+- Multipart bodies (records, batch) never go through `Request.formData()`: `spoolMultipart` (`src/files/spool.ts`)
+  streams each file part to a temp file and yields a `SpooledFile` (a `File` read back from disk). Only a file field's
+  `maxSize` (PB default 5MB) is kept on disk; the rest is counted, so validation still fails with PB's
+  `validation_file_size_limit`. Spool dirs belong to the request scope (`withSpoolScope` middleware) and are removed
+  when it ends, stored or not.
 - OAuth: the app is its own authorization server; codes, refresh tokens, session ids and client secrets are stored only
   as SHA-256, compared in constant time. A redirect goes only to a `redirect_uri` matched against the client's
   registration (loopback: any port). PKCE S256 is mandatory; `state` is optional and echoed back when sent. An access

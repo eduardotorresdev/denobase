@@ -4,7 +4,9 @@ import { ApiError, badRequest, forbidden } from "../core/errors.ts";
 import { tx } from "../core/db.ts";
 import { getCollection } from "../core/registry.ts";
 import { findOne } from "../store/sqlite.ts";
-import { formEntries, JSON_PAYLOAD } from "./form.ts";
+import { formEntries, JSON_PAYLOAD, uploadLimit } from "./form.ts";
+import { allFields } from "../engine/fields.ts";
+import { boundaryOf, multipartBody, spoolMultipart } from "../files/spool.ts";
 
 /** PB core.InternalRequest. */
 interface InternalRequest {
@@ -38,7 +40,7 @@ export function batchRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
     if (!cfg.enabled || cfg.maxRequests <= 0) throw forbidden("Batch requests are not allowed.");
     let form: { requests?: unknown };
     try {
-      form = await readBatch(c);
+      form = await readBatch(c, ctx);
     } catch {
       throw badRequest("Failed to read the submitted batch data.");
     }
@@ -92,11 +94,12 @@ async function run(app: Hono<AppEnv>, c: Context<AppEnv>, ctx: Ctx, requests: In
     if (action.method === "DELETE") payload = undefined;
     else if (r.files?.size) {
       // PB re-encodes a sub-request with files as multipart: regular fields under @jsonPayload, files as parts.
-      const form = new FormData();
-      form.append(JSON_PAYLOAD, JSON.stringify(r.body ?? {}));
-      for (const [k, files] of r.files) for (const f of files) form.append(k, f, f.name);
-      headers.delete("content-type");
-      payload = form;
+      // Built by hand so spooled uploads stream from disk into the sub-request.
+      const parts: [string, string | File][] = [[JSON_PAYLOAD, JSON.stringify(r.body ?? {})]];
+      for (const [k, files] of r.files) for (const f of files) parts.push([k, f]);
+      const multipart = multipartBody(parts);
+      headers.set("content-type", multipart.contentType);
+      payload = multipart.body;
     } else {
       headers.set("content-type", "application/json");
       payload = JSON.stringify(r.body ?? {});
@@ -113,9 +116,13 @@ async function run(app: Hono<AppEnv>, c: Context<AppEnv>, ctx: Ctx, requests: In
 }
 
 /** JSON body, or multipart with the requests in @jsonPayload and files keyed "requests.<i>.<field>". */
-async function readBatch(c: Context<AppEnv>): Promise<{ requests?: unknown }> {
-  if (!(c.req.header("content-type") ?? "").startsWith("multipart/form-data")) return await c.req.json();
-  const entries = formEntries(await c.req.raw.formData());
+async function readBatch(c: Context<AppEnv>, ctx: Ctx): Promise<{ requests?: unknown }> {
+  const boundary = boundaryOf(c.req.header("content-type") ?? "");
+  if (!boundary) return await c.req.json();
+  // Parts may come before the @jsonPayload that says which collection they target: keep up to the largest limit of
+  // any file field, one byte more so an oversize part stays oversize, and let the sub-request apply the exact one.
+  const max = Math.max(0, ...ctx.collections.flatMap((col) => allFields(col).map(uploadLimit))) + 1;
+  const entries = formEntries(await spoolMultipart(c.req.raw.body, boundary, () => max));
   const form = JSON.parse(String(entries.get(JSON_PAYLOAD)?.[0] ?? "{}")) as { requests?: unknown };
   if (!Array.isArray(form.requests)) return form;
   for (const [key, values] of entries) {
