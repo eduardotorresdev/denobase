@@ -78,8 +78,9 @@ Frozen signatures; stubs throw `notImplemented`. Change a signature only with th
   skipping a destination key of the same size and overwriting any other; the destination is always the current storage
   (a run whose target changed fails). One running job (a partial unique index) owned by a 30s lease that a stalled run's
   resume takes over; cancel is a status change seen between keys. `deleteSource` deletes only at the end with zero
-  failures. Superuser routes `GET|POST /api/_denobase/files-migration`, `POST .../resume`, `POST .../cancel` (stable
-  codes `files_migration_*`); progress on the realtime topic `FILES_MIGRATION_TOPIC`, superusers only. CLI
+  failures. Superuser routes `GET|POST /api/_denobase/files-migration`, `GET .../plan` (dry run of the proposal: total,
+  toCopy, same, bytes, from, to; null when none), `POST .../resume`, `POST .../cancel` (stable codes
+  `files_migration_*`); progress on the realtime topic `FILES_MIGRATION_TOPIC`, superusers only. CLI
   `storage migrate --from local|s3 --to local|s3 [--delete-source] [--dry-run]` runs in its own process; `--to` must
   equal the current storage; old S3 creds via `--from-s3-*` or `DENOBASE_FROM_S3_*`; a running job is followed or taken
   over. Backups are not migrated.

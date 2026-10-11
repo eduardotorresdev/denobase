@@ -439,6 +439,18 @@ export class FilesMigrations {
   }
 
   /**
+   * What starting the latest proposal would move (a dry run, nothing written): the UI's "Migrate N files (X MB)".
+   * Null when nothing is proposed.
+   */
+  async plan(): Promise<(MigrationPlan & { id: string; from: string; to: string }) | null> {
+    const proposal = latest(this.deps.aux, `status = 'proposed'`);
+    if (!proposal) return null;
+    const src = await openSource(this.deps.data, proposal.source);
+    const plan = await planMigration(sourceStorage(src, this.deps.storage), this.deps.storage.target);
+    return { ...plan, id: proposal.id, from: proposal.sourceLabel, to: proposal.target };
+  }
+
+  /**
    * Creates the running job (from `from`, else from the latest proposal) without launching it: the CLI runs it in its
    * own process, start() hands it to the job worker.
    */

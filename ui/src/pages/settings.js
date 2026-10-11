@@ -1,8 +1,12 @@
 import { errMessage } from "../pb.js";
-import { badge, errorState, field, loading, page, toast } from "../ui.js";
+import { badge, errorState, field, loading, modal, onUnmount, page, toast, toastError } from "../ui.js";
 import { collectionRow } from "./collections.js";
 import { spring } from "../spring.js";
 import { isTimeZone, offsetLabel } from "../time.js";
+import { canResume, planQuestion, progressLine, progressPercent, statusBadge, whenLine } from "../migration.js";
+
+const MIGRATION = "/api/_denobase/files-migration";
+const MIGRATION_TOPIC = "_denobase/files-migration";
 
 const zones = () => ["UTC", ...Intl.supportedValuesOf("timeZone").filter((z) => z !== "UTC")];
 
@@ -63,6 +67,16 @@ const FIELDS = {
     ["oauth", "cimdDenyDomains", "Metadata document domains denied (comma separated)", "list"],
     ["oauth", "allowLoopback", "Allow loopback redirects (apps on the user's computer)", "bool"],
     ["oauth", "allowedRedirectHosts", "Redirect hosts allowed (comma separated, empty = any https host)", "list"],
+  ],
+  s3: [
+    ["s3", "enabled", "Use S3 storage for record files", "bool"],
+    ["s3", "endpoint", "Endpoint", "text"],
+    ["s3", "bucket", "Bucket", "text"],
+    ["s3", "region", "Region", "text"],
+    ["s3", "accessKey", "Access key", "text"],
+    // GET never returns it: left empty, the saved secret stays.
+    ["s3", "secret", "Secret (leave empty to keep the saved one)", "password"],
+    ["s3", "forcePathStyle", "Force path-style addressing", "bool"],
   ],
   batch: [
     ["batch", "enabled", "Enable batch API", "bool"],
@@ -136,10 +150,13 @@ export function render(route) {
     data.errors = {};
     try {
       const s = await app.pb.settings.update(body);
+      const storageChanged = !!body.s3 && storageKey(data.original?.s3) !== storageKey(s.s3);
       data.original = s;
       data.form = structuredClone(s);
       app.store.settings = s;
       toast("Settings saved.", "success");
+      // The server recorded the storage files lived on until now as a proposal: offer to move them.
+      if (storageChanged) proposeMigration();
     } catch (err) {
       data.errors = flatErrors(err?.response?.data);
       toast(errMessage(err), "error", 6000);
@@ -360,7 +377,8 @@ export function render(route) {
     }
     return t.input({
       className: () => err() ? "input invalid" : "input",
-      type: type === "number" ? "number" : "text",
+      type: type === "number" ? "number" : type === "password" ? "password" : "text",
+      autocomplete: type === "password" ? "new-password" : undefined,
       step: type === "number" ? "any" : undefined,
       value: () => data.form?.[sec]?.[key] ?? "",
       oninput: (e) => {
@@ -488,6 +506,212 @@ export function render(route) {
     );
   }
 
+  /** Same identity the server compares (bucket, endpoint/region): a key rotation moves no file. */
+  function storageKey(c) {
+    return c?.enabled ? `${c.bucket}@${c.endpoint || c.region}` : "local";
+  }
+
+  const mig = store({ state: null, testing: false });
+
+  async function loadMigration() {
+    try {
+      mig.state = await app.pb.send(MIGRATION, { method: "GET", requestKey: "files-migration" });
+    } catch (err) {
+      if (!err?.isAbort) toastError(err);
+    }
+  }
+
+  async function migrationCall(path, body) {
+    try {
+      mig.state = await app.pb.send(`${MIGRATION}${path}`, {
+        method: "POST",
+        body: JSON.stringify(body || {}),
+        headers: { "content-type": "application/json" },
+      });
+      return true;
+    } catch (err) {
+      toastError(err);
+      return false;
+    }
+  }
+
+  async function testS3() {
+    if (mig.testing) return;
+    mig.testing = true;
+    try {
+      await app.pb.settings.testS3("storage");
+      toast("S3 connection succeeded.", "success");
+    } catch (err) {
+      toast(errMessage(err), "error", 8000);
+    } finally {
+      mig.testing = false;
+    }
+  }
+
+  /** After a storage change: "Migrate N files (X MB) from <old> to <new>?", with opt-in delete of the source. */
+  async function proposeMigration() {
+    const f = store({ plan: null, error: null, deleteSource: false, busy: false });
+    modal((close) =>
+      t.div(
+        { className: "stack" },
+        () => {
+          if (f.error) return t.div({ className: "alert alert-danger", textContent: errMessage(f.error) });
+          if (!f.plan) return loading("Counting files in the previous storage...");
+          if (!f.plan.toCopy) {
+            return t.p({ textContent: "Every file of the previous storage is already in the new one." });
+          }
+          return t.p({ className: "migration-question", textContent: planQuestion(f.plan) });
+        },
+        t.div({
+          className: "alert alert-warning",
+          textContent: "Files are read from the new storage only: until the migration copies a file, " +
+            "requests for it return 404. Run it now, or expect missing files until you do.",
+        }),
+        t.label(
+          { className: "field field-check" },
+          t.input({
+            type: "checkbox",
+            className: "checkbox",
+            checked: () => f.deleteSource,
+            onchange: (e) => f.deleteSource = e.target.checked,
+          }),
+          t.span({
+            className: "field-label",
+            textContent: "Delete the files from the previous storage at the end (only if nothing failed)",
+          }),
+        ),
+        t.div(
+          { className: "row" },
+          t.span({ className: "spacer" }),
+          t.button({ type: "button", className: "btn btn-ghost", textContent: "Not now", onclick: close }),
+          t.button({
+            type: "button",
+            className: "btn btn-primary",
+            disabled: () => f.busy || !f.plan,
+            textContent: () => f.busy ? "Starting..." : "Migrate files",
+            onclick: async () => {
+              f.busy = true;
+              if (await migrationCall("", { deleteSource: f.deleteSource })) {
+                close();
+                data.tab = "s3";
+              }
+              f.busy = false;
+            },
+          }),
+        ),
+      ), { title: "Migrate files to the new storage", size: "md" });
+    loadMigration();
+    try {
+      f.plan = await app.pb.send(`${MIGRATION}/plan`, { method: "GET", requestKey: "files-migration-plan" });
+      if (!f.plan) f.error = new Error("There is no previous storage to migrate files from.");
+    } catch (err) {
+      if (!err?.isAbort) f.error = err;
+    }
+  }
+
+  function migrationPanel() {
+    let unsub = null;
+    let gone = false;
+    loadMigration();
+    app.pb.realtime.subscribe(MIGRATION_TOPIC, (s) => mig.state = s)
+      .then((fn) => gone ? fn() : unsub = fn)
+      .catch(() => {/* progress then shows on reload */});
+    const el = t.div({ className: "card stack" }, () => {
+      const s = mig.state;
+      if (!s) return t.p({ className: "muted", textContent: "No files migration yet." });
+      const [label, kind] = statusBadge(s);
+      return t.div(
+        { className: "stack" },
+        t.div(
+          { className: "row" },
+          t.strong({ textContent: "Files migration" }),
+          badge(label, kind),
+          t.span({ className: "spacer" }),
+          t.span({ className: "muted", textContent: whenLine(s) }),
+        ),
+        t.p({
+          className: "muted",
+          textContent: `From ${s.from} to ${s.to}${s.deleteSource ? " (deleting source)" : ""}`,
+        }),
+        s.status === "proposed"
+          ? t.div(
+            { className: "row" },
+            t.span({ textContent: "Files of the previous storage were not moved; they return 404 until copied." }),
+            t.button({ type: "button", className: "btn btn-sm", textContent: "Migrate...", onclick: proposeMigration }),
+          )
+          : t.div(
+            { className: "stack" },
+            t.progress({ className: "migration-progress", max: 100, value: progressPercent(s) }),
+            t.span({ className: "muted", textContent: progressLine(s) }),
+          ),
+        s.status === "running" && !s.stalled
+          ? t.div({
+            className: "alert alert-warning",
+            textContent: "Files not copied yet return 404 until the migration finishes.",
+          })
+          : null,
+        s.error ? t.div({ className: "alert alert-danger", textContent: s.error }) : null,
+        s.failures?.length
+          ? t.details(
+            {},
+            t.summary({ textContent: `${s.failed} failed file${s.failed === 1 ? "" : "s"}` }),
+            t.ul(
+              { className: "mono migration-failures" },
+              s.failures.map((x) => t.li({ textContent: `${x.key}: ${x.error}` })),
+            ),
+          )
+          : null,
+        t.div(
+          { className: "row" },
+          t.span({ className: "spacer" }),
+          s.status === "running" && !s.stalled
+            ? t.button({
+              type: "button",
+              className: "btn btn-sm btn-ghost",
+              textContent: "Cancel",
+              onclick: () => migrationCall("/cancel"),
+            })
+            : null,
+          canResume(s)
+            ? t.button({
+              type: "button",
+              className: "btn btn-sm btn-primary",
+              textContent: "Resume",
+              onclick: () => migrationCall("/resume"),
+            })
+            : null,
+        ),
+      );
+    });
+    return onUnmount(el, () => {
+      gone = true;
+      unsub?.();
+    });
+  }
+
+  function s3Tab() {
+    return t.div(
+      { className: "stack" },
+      formTab("s3"),
+      t.div(
+        { className: "row" },
+        t.span({
+          className: "muted",
+          textContent: () => dirty() ? "Save first: the test uses the saved settings." : "",
+        }),
+        t.span({ className: "spacer" }),
+        t.button({
+          type: "button",
+          className: "btn btn-sm",
+          disabled: () => mig.testing || dirty() || !data.original?.s3?.enabled,
+          textContent: () => mig.testing ? "Testing..." : "Test connection",
+          onclick: testS3,
+        }),
+      ),
+      migrationPanel(),
+    );
+  }
+
   function unsupportedTab(name) {
     return t.fieldset(
       { className: "card", disabled: true },
@@ -538,10 +762,10 @@ export function render(route) {
         if (id === "collections") return t.div({ rid: id }, collectionsTab());
         if (data.loading) return loading();
         if (data.error) return errorState(data.error, load);
+        if (id === "s3") return t.div({ rid: id }, s3Tab());
         if (FIELDS[id]) return t.div({ rid: id }, formTab(id));
         if (id === "rateLimits") return t.div({ rid: id }, rateLimitsTab());
-        if (id === "smtp") return t.div({ rid: id }, unsupportedTab("Sending mail through SMTP"));
-        return t.div({ rid: id }, unsupportedTab("S3 file storage"));
+        return t.div({ rid: id }, unsupportedTab("Sending mail through SMTP"));
       }),
     ),
   );

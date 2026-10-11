@@ -65,6 +65,9 @@ Deno.test("saving settings.s3 proposes a migration; superusers start it and foll
     // No read fallback: the file is 404 until copied.
     assertEquals((await t.app.http.request(url)).status, 404);
 
+    const plan = (await t.call("GET", `${BASE}/plan`)).json;
+    assertEquals([plan.id, plan.from, plan.total, plan.toCopy, plan.bytes], [proposal.id, "local", 1, 1, 5]);
+    assertEquals((await t.call("GET", `${BASE}/plan`, undefined, null)).status, 401);
     assertEquals((await t.call("GET", BASE, undefined, null)).status, 401);
     assertEquals((await t.call("POST", BASE, {}, null)).status, 401);
 

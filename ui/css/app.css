@@ -2311,3 +2311,18 @@ a.list-row:hover {
 .tz-now {
   font-size: 12px;
 }
+
+/* Files migration (settings > Files storage). */
+.migration-progress {
+  width: 100%;
+  height: 8px;
+  accent-color: var(--accent);
+}
+.migration-question {
+  font-weight: 600;
+}
+.migration-failures {
+  max-height: 200px;
+  overflow: auto;
+  font-size: 12px;
+}
