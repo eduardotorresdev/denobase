@@ -52,7 +52,17 @@ export {
   type Settings,
   type SettingsPatch,
 } from "./src/settings/mod.ts";
-export { FsStorage, MemoryStorage, type Storage, type StoredFile } from "./src/files/storage.ts";
+export {
+  type BlobBody,
+  type BlobInfo,
+  type BlobMeta,
+  type BlobObject,
+  type BlobRange,
+  type BlobStore,
+  FsStorage,
+  MemoryStorage,
+  type Storage,
+} from "./src/files/storage.ts";
 export { Cron, type CronTrigger, type Job, Schedule } from "./src/cron/mod.ts";
 export * from "./src/jobs/mod.ts";
 export { dbPath, runTask, type Task } from "./src/workers/mod.ts";

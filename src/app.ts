@@ -14,7 +14,7 @@ import { type AppEnv, createHttp, type Ctx } from "./http/app.ts";
 import { defaultServices, type Services } from "./http/services.ts";
 import { Realtime } from "./realtime/mod.ts";
 import { createStore, type Store } from "./store/mod.ts";
-import type { Storage } from "./files/storage.ts";
+import type { BlobStore } from "./files/storage.ts";
 import { loadSettings, resolveSettings, type Settings, type SettingsPatch } from "./settings/mod.ts";
 import { bundledUi, diskUi } from "./http/ui_source.ts";
 import { McpHost } from "./mcp/host.ts";
@@ -33,7 +33,7 @@ export interface AppOptions {
   /** Overrides for route tests; production uses the real engine and auth. */
   services?: Partial<Services>;
   /** Where record files live; defaults to memory (serve passes pb_data/storage on disk). */
-  storage?: Storage;
+  storage?: BlobStore;
   /** PB's auxiliary db (logs); defaults to memory (serve passes pb_data/auxiliary.db). */
   auxDb?: DatabaseSync;
   /** pb_data on disk: enables backups (zips of the dbs and storage/ kept in <dataDir>/backups). */

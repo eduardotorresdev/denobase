@@ -7,6 +7,7 @@ import { findOne } from "../store/sqlite.ts";
 import { signToken, verifyToken } from "../auth/jwt.ts";
 import { allFields } from "../engine/fields.ts";
 import { recordDir } from "../engine/files.ts";
+import { serveContent } from "./serve_content.ts";
 
 /** PB file routes: POST /api/files/token and GET /api/files/{collection}/{recordId}/{filename}. */
 
@@ -104,19 +105,23 @@ export function fileRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
         throw notFound();
       }
     }
-    const stored = await ctx.store.storage.get(recordDir(col, id) + filename);
-    if (!stored) throw notFound();
+    const key = recordDir(col, id) + filename;
+    const info = await ctx.store.storage.stat(key);
+    if (!info) throw notFound();
     // Thumbs are not generated yet; PB itself serves the original when a thumb cannot be made.
-    const type = contentType(filename, stored.type);
+    const type = contentType(filename, info.type);
     const disposition = !truthy(c.req.query("download")) && INLINE.has(type.split(";")[0]) ? "inline" : "attachment";
-    return new Response(stored.data, {
-      headers: {
-        "Content-Disposition": `${disposition}; filename=${JSON.stringify(filename)}`,
-        "Content-Type": type,
-        "Content-Security-Policy": "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; sandbox",
-        "Cache-Control": "max-age=2592000, stale-while-revalidate=86400",
-        "Content-Length": String(stored.data.byteLength),
-      },
+    const headers = new Headers({
+      "Content-Disposition": `${disposition}; filename=${JSON.stringify(filename)}`,
+      "Content-Type": type,
+      "Content-Security-Policy": "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; sandbox",
+      "Cache-Control": "max-age=2592000, stale-while-revalidate=86400",
+    });
+    return await serveContent({
+      request: c.req.raw,
+      info,
+      headers,
+      open: async (range) => (await ctx.store.storage.get(key, { range }))?.body ?? null,
     });
   });
 }

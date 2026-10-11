@@ -169,3 +169,54 @@ Deno.test("file fields filter like PB multivaluers: :length, any-of and the REST
   assertEquals(await list("@request.headers.x_marca = 'sim'", { "X-Marca": "sim" }), ["dois", "um"]);
   assertEquals(await list("@request.headers.x_marca = 'sim'"), []);
 });
+
+Deno.test("files serve like Go's http.ServeContent: ranges, 416 and conditionals", async () => {
+  const t = await setup();
+  const r = await t.send("POST", "/api/collections/fl_docs/records", t.fd([["anexos", txt("r.txt", "0123456789")]]));
+  const url = `/api/files/fl_docs/${r.json.id}/${r.json.anexos[0]}`;
+  const get = (headers: Record<string, string>) => t.app.http.request(url, { headers });
+
+  const full = await get({});
+  assertEquals([full.status, full.headers.get("accept-ranges"), await full.text()], [200, "bytes", "0123456789"]);
+  const lastModified = full.headers.get("last-modified")!;
+  assert(lastModified);
+
+  const one = await get({ Range: "bytes=2-4" });
+  assertEquals([one.status, one.headers.get("content-range"), one.headers.get("content-length")], [
+    206,
+    "bytes 2-4/10",
+    "3",
+  ]);
+  assertEquals(await one.text(), "234");
+  const suffix = await get({ Range: "bytes=-3" });
+  assertEquals([suffix.headers.get("content-range"), await suffix.text()], ["bytes 7-9/10", "789"]);
+
+  const multi = await get({ Range: "bytes=0-0,8-" });
+  assertEquals(multi.status, 206);
+  const boundary = multi.headers.get("content-type")!.match(/^multipart\/byteranges; boundary=(\w+)$/)![1];
+  const body = await multi.text();
+  assertEquals(Number(multi.headers.get("content-length")), new TextEncoder().encode(body).byteLength);
+  assertEquals(
+    body,
+    `--${boundary}\r\nContent-Range: bytes 0-0/10\r\nContent-Type: text/plain\r\n\r\n0` +
+      `\r\n--${boundary}\r\nContent-Range: bytes 8-9/10\r\nContent-Type: text/plain\r\n\r\n89\r\n--${boundary}--\r\n`,
+  );
+
+  const past = await get({ Range: "bytes=20-" });
+  assertEquals([past.status, past.headers.get("content-range")], [416, "bytes */10"]);
+  assertEquals(await past.text(), "invalid range: failed to overlap\n");
+  const bad = await get({ Range: "items=0-1" });
+  assertEquals(bad.status, 416);
+  await bad.body?.cancel();
+  // Asking for more than the file, through overlaps, gets the whole file.
+  const over = await get({ Range: "bytes=0-9,0-9" });
+  assertEquals([over.status, await over.text()], [200, "0123456789"]);
+
+  const cached = await get({ "If-Modified-Since": lastModified });
+  assertEquals([cached.status, cached.headers.get("content-type")], [304, null]);
+  await cached.body?.cancel();
+  const stale = await get({ Range: "bytes=0-1", "If-Range": "Mon, 01 Jan 2001 00:00:00 GMT" });
+  assertEquals([stale.status, await stale.text()], [200, "0123456789"]);
+  const fresh = await get({ Range: "bytes=0-1", "If-Range": lastModified });
+  assertEquals([fresh.status, await fresh.text()], [206, "01"]);
+});

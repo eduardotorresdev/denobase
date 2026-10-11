@@ -254,7 +254,7 @@ async function storeFiles(req: Req, c: CollectionConfig, id: string, files: File
   const { storage } = req.store;
   const dir = recordDir(c, id);
   for (const u of files.uploads) {
-    await storage.put(dir + u.name, { data: new Uint8Array(await u.file.arrayBuffer()), type: u.file.type });
+    await storage.put(dir + u.name, u.file.stream(), { type: u.file.type });
   }
   if (files.removed.length) {
     afterCommit(req.db, () => void Promise.all(files.removed.map((n) => storage.delete(dir + n))));
