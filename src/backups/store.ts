@@ -1,5 +1,8 @@
 import { stamp } from "../core/time.ts";
 import { validKey } from "./name.ts";
+import { CurrentStorage } from "../files/current.ts";
+import { type BlobBody, type BlobObject, type BlobStore, FsStorage } from "../files/storage.ts";
+import type { S3Config } from "../settings/model.ts";
 
 export interface BackupInfo {
   key: string;
@@ -7,43 +10,87 @@ export interface BackupInfo {
   modified: string;
 }
 
-/** pb_data/backups: the zips, by key (file name). PB's backups filesystem, local only. */
-export class BackupStore {
-  constructor(readonly dir: string) {}
+const ZIP = { type: "application/zip" };
 
-  async list(): Promise<BackupInfo[]> {
-    const out: BackupInfo[] = [];
-    try {
-      for await (const e of Deno.readDir(this.dir)) {
-        if (!e.isFile) continue;
-        const st = await Deno.stat(`${this.dir}/${e.name}`);
-        out.push({ key: e.name, size: st.size, modified: stamp(st.mtime ?? new Date(0)) });
-      }
-    } catch (e) {
-      if (!(e instanceof Deno.errors.NotFound)) throw e;
-    }
-    return out.sort((a, b) => a.key.localeCompare(b.key));
+/** Lists a backups BlobStore's zips: only the top level, never the FsStorage sidecars or a zip being written. */
+export async function listBackups(store: BlobStore): Promise<BackupInfo[]> {
+  const out: BackupInfo[] = [];
+  for await (const b of store.list("")) {
+    if (b.key.includes("/")) continue;
+    out.push({ key: b.key, size: b.size, modified: stamp(b.modified) });
+  }
+  return out.sort((a, b) => a.key.localeCompare(b.key));
+}
+
+/** Puts a zip under key, refusing a taken one (PB never overwrites a backup). */
+export async function writeBackup(store: BlobStore, key: string, body: BlobBody): Promise<void> {
+  if (await store.stat(key)) {
+    if (body instanceof ReadableStream) await body.cancel();
+    throw new Error(`backup ${key} already exists`);
+  }
+  await store.put(key, body, ZIP);
+}
+
+/** PB autobackup pruning: keep the newest `maxKeep` zips with the prefix; returns how many went. */
+export async function pruneBackups(store: BlobStore, prefix: string, maxKeep: number): Promise<number> {
+  if (maxKeep <= 0) return 0;
+  const auto = (await listBackups(store)).filter((b) => b.key.startsWith(prefix));
+  auto.sort((a, b) => b.modified.localeCompare(a.modified) || b.key.localeCompare(a.key));
+  const old = auto.slice(maxKeep);
+  for (const b of old) await store.delete(b.key);
+  return old.length;
+}
+
+/**
+ * PB's backups filesystem: pb_data/backups, or the bucket settings.backups.s3 names. Behind a CurrentStorage so a
+ * settings save swaps the backend without rebuilding Backups; a run in flight finishes where it started.
+ */
+export class BackupStore {
+  readonly #current: CurrentStorage;
+  #s3: S3Config | null = null;
+
+  constructor(readonly dir: string) {
+    this.#current = new CurrentStorage(new FsStorage(dir));
+  }
+
+  /** Points at what settings.backups.s3 names. */
+  use(cfg: S3Config): void {
+    this.#s3 = cfg.enabled ? structuredClone(cfg) : null;
+    this.#current.use(cfg);
+  }
+
+  /** The config a worker rebuilds the same backend from (null: the local dir). */
+  get s3(): S3Config | null {
+    return this.#s3;
+  }
+
+  get blobs(): BlobStore {
+    return this.#current.target;
+  }
+
+  list(): Promise<BackupInfo[]> {
+    return listBackups(this.blobs);
   }
 
   async exists(key: string): Promise<boolean> {
+    if (!validKey(key)) return false;
     try {
-      return validKey(key) && (await Deno.stat(`${this.dir}/${key}`)).isFile;
+      return (await this.blobs.stat(key)) !== null;
     } catch {
       return false;
     }
   }
 
-  read(key: string): Promise<Uint8Array<ArrayBuffer>> {
-    return Deno.readFile(`${this.dir}/${key}`);
+  get(key: string): Promise<BlobObject | null> {
+    return this.blobs.get(key);
   }
 
   /** Never overwrites: a taken key fails. */
-  async write(key: string, data: Uint8Array): Promise<void> {
-    await Deno.mkdir(this.dir, { recursive: true });
-    await Deno.writeFile(`${this.dir}/${key}`, data, { createNew: true });
+  write(key: string, body: BlobBody): Promise<void> {
+    return writeBackup(this.blobs, key, body);
   }
 
-  async delete(key: string): Promise<void> {
-    await Deno.remove(`${this.dir}/${key}`);
+  delete(key: string): Promise<void> {
+    return this.blobs.delete(key);
   }
 }

@@ -66,15 +66,15 @@ export function backupRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
     const fail = (code: string, message: string) =>
       badRequest("An error occurred while validating the submitted data.", { file: { code, message } });
     if (!file) throw fail("validation_required", "Cannot be blank.");
-    const data = new Uint8Array(await file.arrayBuffer());
-    if (!isZip(data)) {
+    // Only the magic is sniffed in memory; the zip itself streams to the store (a file, or an S3 multipart upload).
+    if (!isZip(new Uint8Array(await file.slice(0, 4).arrayBuffer()))) {
       throw fail("validation_invalid_mime_type", `"${file.name}" mime type must be one of: application/zip.`);
     }
     if (!validKey(file.name) || await b.exists(file.name)) {
       throw fail("validation_backup_name_exists", "Backup file with the specified name already exists.");
     }
     try {
-      await b.upload(file.name, data);
+      await b.upload(file.name, file.stream());
     } catch {
       throw badRequest("Failed to upload backup.");
     }
@@ -88,13 +88,14 @@ export function backupRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
     const key = c.req.param("key");
     const b = fs();
     if (!(await b.exists(key))) throw badRequest("Missing or invalid backup file.");
-    const data = await b.read(key);
-    return new Response(data, {
+    const obj = await b.get(key);
+    if (!obj) throw badRequest("Missing or invalid backup file.");
+    return new Response(obj.body, {
       headers: {
         "Content-Disposition": `attachment; filename=${JSON.stringify(key)}`,
         "Content-Type": "application/zip",
         "Content-Security-Policy": "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; sandbox",
-        "Content-Length": String(data.byteLength),
+        "Content-Length": String(obj.size),
       },
     });
   });

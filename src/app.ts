@@ -132,6 +132,9 @@ export function createApp(opts: AppOptions): App {
   const cron = new Cron(() => settings.meta.timezone, tracer);
   cron.useRunner(jobs);
   systemJobs(cron, db, logs, settings);
+  // settings.backups.s3 picks where zips go, swapped on every settings change like the files storage.
+  backups?.use(settings.backups.s3, settings.s3);
+  if (backups) onSettingsChange.push((s) => backups.use(s.backups.s3, s.s3));
   const reloadAutoBackups = autoBackups(cron, backups, settings);
   onSettingsChange.push(reloadAutoBackups);
   const mcp = new McpHost(opts.mcp);
