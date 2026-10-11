@@ -63,6 +63,9 @@ export {
   MemoryStorage,
   type Storage,
 } from "./src/files/storage.ts";
+export { CurrentStorage, storageFromSettings } from "./src/files/current.ts";
+export { MULTIPART_THRESHOLD, S3Storage } from "./src/files/s3/storage.ts";
+export { S3Client, S3Error } from "./src/files/s3/client.ts";
 export { Cron, type CronTrigger, type Job, Schedule } from "./src/cron/mod.ts";
 export * from "./src/jobs/mod.ts";
 export { dbPath, runTask, type Task } from "./src/workers/mod.ts";

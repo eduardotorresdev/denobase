@@ -129,3 +129,4 @@ export function collectSpans(app: App): { spans(): StoredSpan[]; reset(): void }
     },
   };
 }
+export { type FakeS3, type FakeS3Object, type FakeS3Options, type FakeS3Request, startFakeS3 } from "./fake_s3.ts";

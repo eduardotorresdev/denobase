@@ -14,7 +14,8 @@ import { type AppEnv, createHttp, type Ctx } from "./http/app.ts";
 import { defaultServices, type Services } from "./http/services.ts";
 import { Realtime } from "./realtime/mod.ts";
 import { createStore, type Store } from "./store/mod.ts";
-import type { BlobStore } from "./files/storage.ts";
+import { type BlobStore, MemoryStorage } from "./files/storage.ts";
+import { CurrentStorage } from "./files/current.ts";
 import { loadSettings, resolveSettings, type Settings, type SettingsPatch } from "./settings/mod.ts";
 import { bundledUi, diskUi } from "./http/ui_source.ts";
 import { McpHost } from "./mcp/host.ts";
@@ -88,7 +89,9 @@ export function createApp(opts: AppOptions): App {
   const { db } = opts;
   // A db the caller opened itself (not through openDb) still needs the SQL functions filters compile to (fold).
   ensureMathFunctions(db);
-  const store = createStore(db, opts.storage);
+  // The store keeps one storage for its life; settings.s3 decides what is behind it (see the swap below).
+  const files = new CurrentStorage(opts.storage ?? new MemoryStorage());
+  const store = createStore(db, files);
   const mailer = opts.mailer ?? mailerFromEnv();
   const s: Services = { ...defaultServices, ...opts.services };
   const realtime = new Realtime(store, s);
@@ -98,7 +101,9 @@ export function createApp(opts: AppOptions): App {
   // Other threads on the same file (job worker, HTTP isolates): their record writes reach this thread's realtime and
   // remote listeners, and a settings change saved by one reaches the others.
   const stopSharing = shared ? shareRecordEvents(db, shared) : () => {};
-  const onSettingsChange: ((s: Settings) => void)[] = [];
+  files.use(settings.s3);
+  // PB builds its filesystem from settings.s3 on each use: a saved change applies to the next file operation.
+  const onSettingsChange: ((s: Settings) => void)[] = [(s) => files.use(s.s3)];
   let settingsStamp = settingsUpdated(db);
   // The baseline: what was committed before this app existed is already in what it loaded.
   syncExternalCommits(db);

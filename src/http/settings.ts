@@ -5,6 +5,14 @@ import { mergeSettings, publicSettings, saveSettings, type Settings, validateSet
 import { renderTemplate, TEMPLATES } from "../auth/templates.ts";
 import { readBody } from "./form.ts";
 import { requireSuperuser } from "./guards.ts";
+import { S3Storage } from "../files/s3/storage.ts";
+
+const ALNUM = "abcdefghijklmnopqrstuvwxyz0123456789";
+
+function randomString(n: number): string {
+  const b = crypto.getRandomValues(new Uint8Array(n));
+  return Array.from(b, (x) => ALNUM[x % ALNUM.length]).join("");
+}
 
 const TEST_TEMPLATES: Record<string, keyof typeof TEMPLATES | undefined> = {
   verification: "verification",
@@ -68,10 +76,38 @@ export function settingsRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
     return c.body(null, 204);
   });
 
-  // No S3 and no OAuth2 providers yet: PB's raw-error answers say so instead of a silent 404.
-  app.post("/api/settings/test/s3", () => {
-    throw badRequest("Failed to test the S3 filesystem. Raw error: \nS3 is not supported by this server.");
+  // PB forms.TestS3Filesystem: write and delete a throwaway object with the saved config of that filesystem.
+  app.post("/api/settings/test/s3", async (c) => {
+    let b: Record<string, unknown>;
+    try {
+      b = await readBody(c);
+    } catch {
+      throw badRequest("An error occurred while loading the submitted data.");
+    }
+    const fs = typeof b.filesystem === "string" ? b.filesystem : "";
+    if (!fs) {
+      throw badRequest("Failed to test the S3 filesystem.", {
+        filesystem: { code: "validation_required", message: "Cannot be blank." },
+      });
+    }
+    if (fs !== "storage" && fs !== "backups") {
+      throw badRequest("Failed to test the S3 filesystem.", {
+        filesystem: { code: "validation_in_invalid", message: "Must be a valid value." },
+      });
+    }
+    const cfg = fs === "backups" ? ctx.settings.backups.s3 : ctx.settings.s3;
+    try {
+      if (!cfg.enabled) throw new Error("S3 storage filesystem is not enabled");
+      const s3 = new S3Storage(cfg);
+      const key = `pb_settings_test/${randomString(5)}.txt`;
+      await s3.put(key, new TextEncoder().encode("test"), { type: "text/plain" });
+      await s3.delete(key);
+    } catch (e) {
+      throw badRequest(`Failed to test the S3 filesystem. Raw error: \n${(e as Error).message}`);
+    }
+    return c.body(null, 204);
   });
+  // No OAuth2 providers yet: PB's raw-error answer says so instead of a silent 404.
   app.post("/api/settings/apple/generate-client-secret", () => {
     throw badRequest("Failed to generate client secret. Raw error: \nOAuth2 is not supported by this server.");
   });
