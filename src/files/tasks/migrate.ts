@@ -14,7 +14,7 @@ export default async function migrateFiles(input: { id: string }, ctx: JobContex
       aux: ctx.internalDb("aux"),
       data: ctx.internalDb("data"),
       storage,
-      s3: ctx.settings.s3,
+      s3: () => ctx.settings.s3,
       progress: (s: MigrationState) => ctx.call(PROGRESS_OP, s),
     }));
 }

@@ -241,12 +241,23 @@ async function removeRecord(a: Omit<WriteArgs, "data"> & { id: string }): Promis
     sql.remove(req.db, c, a.id);
     forgetFoundRelations(req);
     // PB deletes a record's files only once the delete is committed.
-    if (fileNames(c, doc).length) afterCommit(req.db, () => void req.store.storage.deletePrefix(recordDir(c, a.id)));
+    if (fileNames(c, doc).length) {
+      const dir = recordDir(c, a.id);
+      afterCommit(req.db, () => void req.store.storage.deletePrefix(dir).catch((e) => logFileDeleteError(dir, e)));
+    }
     const after = c.hooks?.afterDelete ?? [];
     await traceHook(c, "afterDelete", after.length, async () => {
       for (const h of after) await h({ req, collection: c, id: a.id, doc });
     });
   });
+}
+
+/**
+ * After commit the record is gone and nobody awaits the cleanup: a storage failure (S3 down, 5xx) must only be
+ * logged, as PB does, since an unhandled rejection would end the process.
+ */
+function logFileDeleteError(key: string, e: unknown): void {
+  console.error("Failed to delete files", key, e);
 }
 
 /** Uploads inside the write's tx (a failed upload rolls the row back); dropped files go only after commit. */
@@ -257,6 +268,8 @@ async function storeFiles(req: Req, c: CollectionConfig, id: string, files: File
     await storage.put(dir + u.name, u.file.stream(), { type: u.file.type });
   }
   if (files.removed.length) {
-    afterCommit(req.db, () => void Promise.all(files.removed.map((n) => storage.delete(dir + n))));
+    afterCommit(req.db, () => {
+      for (const n of files.removed) void storage.delete(dir + n).catch((e) => logFileDeleteError(dir + n, e));
+    });
   }
 }

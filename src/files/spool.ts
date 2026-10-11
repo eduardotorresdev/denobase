@@ -78,8 +78,13 @@ export async function withSpoolScope<T>(fn: () => Promise<T>): Promise<T> {
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
-/** Text parts stay in memory; above this a form is not a form (Go's multipart caps the non-file part too). */
-const MAX_TEXT = 32 << 20;
+/**
+ * Text parts stay in memory, so their sum is capped across the whole form, as Go's ReadForm caps all non-file data
+ * together (maxMemory + 10MB); a per-part cap alone lets many parts pile up without bound.
+ */
+const MAX_TEXT = (32 << 20) + (10 << 20);
+/** Go's default multipartmaxparts: every part costs headers and bookkeeping, file or not. */
+const MAX_PARTS = 1000;
 
 function indexOf(hay: Uint8Array, needle: Uint8Array, from = 0): number {
   const first = needle[0];
@@ -146,6 +151,8 @@ export async function spoolMultipart(
   } | null = null;
   let dir: string | undefined;
   let seq = 0;
+  let textTotal = 0;
+  let parts = 0;
 
   const write = async (chunk: Uint8Array) => {
     if (!part || !chunk.length) return;
@@ -160,7 +167,8 @@ export async function spoolMultipart(
       return;
     }
     part.textLen += chunk.length;
-    if (part.textLen > MAX_TEXT) throw new Error("multipart: text part too large");
+    textTotal += chunk.length;
+    if (textTotal > MAX_TEXT) throw new Error("multipart: form text too large");
     part.text!.push(chunk.slice());
   };
 
@@ -218,6 +226,7 @@ export async function spoolMultipart(
             if (buf.length > 64 << 10) throw new Error("multipart: headers too large");
             break;
           }
+          if (++parts > MAX_PARTS) throw new Error("multipart: too many parts");
           const h = headersOf(empty ? "" : dec.decode(buf.subarray(0, end)));
           buf = buf.subarray(empty ? 2 : end + 4);
           const disp = h.get("content-disposition") ?? "";

@@ -186,21 +186,33 @@ export async function serveContent(o: ServeContentOptions): Promise<Response> {
   headers.set("Content-Type", `multipart/byteranges; boundary=${boundary}`);
   headers.set("Content-Length", String(total));
   if (head) return new Response(null, { status: 206, headers });
+  // Pull-driven, one range open at a time: the client's pace bounds what is read, and a disconnect stops it.
+  let i = 0;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let done = false;
   const stream = new ReadableStream<Uint8Array>({
-    async start(ctl) {
-      try {
-        for (let i = 0; i < ranges.length; i++) {
-          ctl.enqueue(parts[i]);
-          const r = ranges[i];
-          const s = await body({ start: r.start, end: r.start + r.length - 1 });
-          for await (const chunk of s!) ctl.enqueue(chunk);
-        }
-        ctl.enqueue(tail);
-        ctl.close();
-      } catch (e) {
-        ctl.error(e);
+    async pull(ctl) {
+      if (reader) {
+        const r = await reader.read();
+        if (!r.done) return ctl.enqueue(r.value);
+        reader = null;
+        i++;
       }
+      if (i < ranges.length) {
+        const r = ranges[i];
+        reader = (await body({ start: r.start, end: r.start + r.length - 1 }))!.getReader();
+        return ctl.enqueue(parts[i]);
+      }
+      if (!done) {
+        done = true;
+        ctl.enqueue(tail);
+      }
+      ctl.close();
     },
-  });
+    async cancel(reason) {
+      await reader?.cancel(reason).catch(() => {});
+      reader = null;
+    },
+  }, { highWaterMark: 0 });
   return new Response(stream, { status: 206, headers });
 }

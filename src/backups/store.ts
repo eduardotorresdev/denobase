@@ -1,7 +1,14 @@
 import { stamp } from "../core/time.ts";
 import { validKey } from "./name.ts";
 import { CurrentStorage } from "../files/current.ts";
-import { type BlobBody, type BlobObject, type BlobStore, FsStorage } from "../files/storage.ts";
+import {
+  type BlobBody,
+  type BlobInfo,
+  type BlobObject,
+  type BlobRange,
+  type BlobStore,
+  FsStorage,
+} from "../files/storage.ts";
 import type { S3Config } from "../settings/model.ts";
 
 export interface BackupInfo {
@@ -81,8 +88,12 @@ export class BackupStore {
     }
   }
 
-  get(key: string): Promise<BlobObject | null> {
-    return this.blobs.get(key);
+  get(key: string, opts?: { range?: BlobRange }): Promise<BlobObject | null> {
+    return this.blobs.get(key, opts);
+  }
+
+  stat(key: string): Promise<BlobInfo | null> {
+    return validKey(key) ? this.blobs.stat(key) : Promise.resolve(null);
   }
 
   /** Never overwrites: a taken key fails. */

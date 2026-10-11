@@ -72,8 +72,35 @@ export function storageLabel(s3: S3Config): string {
   return s3.enabled ? s3Label(s3) : "local";
 }
 
+/**
+ * The endpoint resolved as the S3 client resolves it (empty -> AWS's regional one, no scheme -> https), so one bucket
+ * spelled two ways is one label. Not the whole guard: run() also probes for the same storage before deleting.
+ */
 function s3Label(c: S3Config): string {
-  return `s3:${c.bucket}@${c.endpoint || c.region}`;
+  const raw = c.endpoint.trim() || `https://s3.${c.region || "us-east-1"}.amazonaws.com`;
+  let ep = raw;
+  try {
+    const u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+    ep = `${u.protocol}//${u.host}${u.pathname.replace(/\/+$/, "")}`;
+  } catch { /* an unparsable endpoint keeps its spelling */ }
+  return `s3:${c.bucket}@${ep}`;
+}
+
+/** Outside the record-file key shape ("<col>/<id>/<file>"), so listings and migrations never pick it up. */
+const PROBE_PREFIX = "_denobase_migration_probe/";
+
+/**
+ * True when src and dst are one storage under two configs (labels can still differ: a CNAME, path vs virtual host).
+ * A marker written to dst and seen at src proves it; deleting the source then would delete the destination's files.
+ */
+async function sameStorage(src: BlobStore, dst: BlobStore): Promise<boolean> {
+  const key = PROBE_PREFIX + crypto.randomUUID();
+  await dst.put(key, new Uint8Array([1]), { type: "application/octet-stream" });
+  try {
+    return (await src.stat(key)) !== null;
+  } finally {
+    await dst.delete(key).catch(() => {});
+  }
 }
 
 // --- secrets ---------------------------------------------------------------------------------------------------
@@ -229,8 +256,8 @@ export interface RunDeps {
   data: DatabaseSync;
   /** The app's files storage: its target is the destination, its local the "local" source. */
   storage: CurrentStorage;
-  /** settings.s3 as this thread sees it now. */
-  s3: S3Config;
+  /** settings.s3 as this thread sees it now; a getter is read again before every key, so a change stops the run. */
+  s3: S3Config | (() => S3Config);
   /** Called with every (throttled) progress update and the final state. */
   progress?: (s: MigrationState) => unknown;
   /** Who runs it; a lease held by another owner and not expired makes this run return without work. */
@@ -264,6 +291,18 @@ export async function runMigration(id: string, deps: RunDeps): Promise<boolean> 
        AND (owner = ? OR leaseUntil < ?)`,
     ).run(owner, Date.now() + LEASE_MS, id, owner, Date.now()).changes > 0;
   if (!claim()) return false;
+  const currentS3 = () => (typeof deps.s3 === "function" ? deps.s3() : deps.s3);
+  // Renewed on a timer, not only per key: a long listing, one big put or the delete phase outlive LEASE_MS, and a
+  // lapsed lease lets a second run take the job over while this one still works.
+  const renew = aux.prepare(
+    `UPDATE _files_migrations SET leaseUntil = ? WHERE id = ? AND owner = ? AND status = 'running'`,
+  );
+  let lost = false;
+  const heartbeat = setInterval(() => {
+    try {
+      if (renew.run(Date.now() + LEASE_MS, id, owner).changes === 0) lost = true;
+    } catch { /* a busy db: the next beat or key renews it */ }
+  }, LEASE_MS / 3);
 
   let r = row(aux, id)!;
   let lastPublish = 0;
@@ -279,20 +318,26 @@ export async function runMigration(id: string, deps: RunDeps): Promise<boolean> 
   const finish = async (status: MigrationStatus, error = "") => {
     aux.prepare(
       `UPDATE _files_migrations SET status = ?, error = ?, finished = ?, updated = ?, leaseUntil = 0
-       WHERE id = ? AND status = 'running'`,
-    ).run(status, error, nowStamp(), nowStamp(), id);
+       WHERE id = ? AND status = 'running' AND owner = ?`,
+    ).run(status, error, nowStamp(), nowStamp(), id, owner);
     await publish(true);
   };
 
+  const targetChanged = async () => {
+    const target = storageLabel(currentS3());
+    if (target === r.target) return false;
+    await finish("failed", `The files storage changed to ${target} since this migration was started for ${r.target}.`);
+    return true;
+  };
+  const statusOf = aux.prepare(`SELECT status, owner FROM _files_migrations WHERE id = ?`);
+  /** Canceled, or taken over by another run: stop without touching the row. */
+  const stillMine = () => {
+    const now = statusOf.get(id) as { status: string; owner: string };
+    return !lost && now.status === "running" && now.owner === owner;
+  };
+
   try {
-    const target = storageLabel(deps.s3);
-    if (target !== r.target) {
-      await finish(
-        "failed",
-        `The files storage changed to ${target} since this migration was started for ${r.target}.`,
-      );
-      return true;
-    }
+    if (await targetChanged()) return true;
     const src = sourceStorage(await openSource(deps.data, r.source), deps.storage);
     const dst = deps.storage.target;
     const keys = await listKeys(src);
@@ -304,12 +349,11 @@ export async function runMigration(id: string, deps: RunDeps): Promise<boolean> 
       `UPDATE _files_migrations SET cursor = ?, processed = processed + 1, copied = copied + ?, skipped = skipped + ?,
        failed = failed + ?, bytes = bytes + ?, failures = ?, updated = ?, leaseUntil = ? WHERE id = ? AND owner = ?`,
     );
-    const statusOf = aux.prepare(`SELECT status, owner FROM _files_migrations WHERE id = ?`);
     for (const { key, size } of keys) {
       if (r.cursor && key <= r.cursor) continue;
-      const now = statusOf.get(id) as { status: string; owner: string };
-      // Canceled, or a crashed-looking lease taken over by someone else: stop without touching the row.
-      if (now.status !== "running" || now.owner !== owner) return true;
+      if (!stillMine()) return true;
+      // The app reads from whatever settings.s3 names now: copying on into the old target would strand the files.
+      if (await targetChanged()) return true;
       let copied = 0, skipped = 0, failed = 0, bytes = 0;
       try {
         const there = await dst.stat(key);
@@ -343,22 +387,29 @@ export async function runMigration(id: string, deps: RunDeps): Promise<boolean> 
       await publish();
     }
 
+    if (!stillMine()) return true;
     r = row(aux, id)!;
-    if (r.status !== "running") return true;
     if (r.failed > 0) {
       await finish("failed", `${r.failed} file(s) could not be copied; the source was left as it was.`);
       return true;
     }
     // Only now, with every file at the destination: deleting earlier would lose what a failure left behind.
     if (r.deleteSource) {
+      if (await targetChanged()) return true;
+      if (await sameStorage(src, dst)) {
+        await finish("failed", "The source and the destination are the same storage; nothing was deleted.");
+        return true;
+      }
       for (const { key } of keys) {
-        if ((statusOf.get(id) as { status: string }).status !== "running") return true;
+        if (!stillMine() || await targetChanged()) return true;
         await src.delete(key);
       }
     }
     await finish("done");
   } catch (e) {
     await finish("failed", (e as Error).message);
+  } finally {
+    clearInterval(heartbeat);
   }
   return true;
 }

@@ -213,3 +213,77 @@ Deno.test("no proposal without a storage change; same source and target is refus
   await assertRejects(() => t.mig.create(), Error, "no previous storage");
   await assertRejects(() => t.mig.create({ from: { kind: "local" } }), Error, "already uses");
 });
+
+Deno.test("one bucket under two endpoint spellings is one storage: delete-source never deletes the destination", async () => {
+  const fake = startFakeS3();
+  const t = setup(OFF);
+  try {
+    fake.objects.set("c1/r1/a.txt", { data: new TextEncoder().encode("a"), type: "text/plain", modified: new Date() });
+    // Same bucket, the endpoint written another way: equal labels after resolving, refused up front.
+    const slash = { ...fake.config, endpoint: `${fake.endpoint}/` };
+    t.settings.s3 = fake.config;
+    t.storage.use(fake.config);
+    await assertRejects(() => t.mig.create({ from: { kind: "s3", s3: slash } }), Error, "already uses");
+    // A host alias the labels cannot see through: the run's probe finds the marker at the source and deletes nothing.
+    const alias = { ...fake.config, endpoint: fake.endpoint.replace("127.0.0.1", "localhost") };
+    const job = await t.mig.create({ from: { kind: "s3", s3: alias }, deleteSource: true });
+    await runMigration(job.id, { ...t, s3: () => t.settings.s3 });
+    const s = t.mig.get(job.id)!;
+    assertEquals(s.status, "failed");
+    assertStringIncludes(s.error, "same storage");
+    assertEquals([...fake.objects.keys()], ["c1/r1/a.txt"]);
+  } finally {
+    await fake.close();
+  }
+});
+
+Deno.test("a settings.s3 change mid-run stops the run before more copies or any source delete", async () => {
+  const a = startFakeS3();
+  const b = startFakeS3();
+  const t = setup(OFF);
+  try {
+    for (const k of ["a", "b", "c"]) await put(t.local, `c1/r1/${k}.txt`, k);
+    await t.switchTo(a.config);
+    const job = await t.mig.create({ deleteSource: true });
+    // The superuser saves another bucket while the first file is being copied.
+    const get = t.local.get.bind(t.local);
+    t.local.get = (key, opts) => {
+      t.settings.s3 = b.config;
+      t.storage.use(b.config);
+      return get(key, opts);
+    };
+    await runMigration(job.id, { ...t, s3: () => t.settings.s3 });
+    const s = t.mig.get(job.id)!;
+    assertEquals(s.status, "failed");
+    assertStringIncludes(s.error, "changed to");
+    assertEquals([a.objects.size, t.local.files.size], [1, 3]);
+  } finally {
+    await a.close();
+    await b.close();
+  }
+});
+
+Deno.test("a run that lost its job to another owner neither finishes it nor deletes the source", async () => {
+  const fake = startFakeS3();
+  const t = setup(OFF);
+  try {
+    for (const k of ["a", "b"]) await put(t.local, `c1/r1/${k}.txt`, k);
+    await t.switchTo(fake.config);
+    const job = await t.mig.create({ deleteSource: true });
+    // While the last file copies, another process takes the job over (this run's lease looked expired).
+    const get = t.local.get.bind(t.local);
+    t.local.get = (key, opts) => {
+      if (key === "c1/r1/b.txt") {
+        t.aux.prepare(`UPDATE _files_migrations SET owner = 'other', leaseUntil = ? WHERE id = ?`)
+          .run(Date.now() + 60_000, job.id);
+      }
+      return get(key, opts);
+    };
+    assertEquals(await runMigration(job.id, { ...t, s3: () => t.settings.s3 }), true);
+    const s = t.mig.get(job.id)!;
+    assertEquals([s.status, s.finished], ["running", ""]);
+    assertEquals(t.local.files.size, 2);
+  } finally {
+    await fake.close();
+  }
+});

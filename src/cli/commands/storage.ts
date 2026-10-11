@@ -9,6 +9,7 @@ import {
   type MigrationState,
   planMigration,
   runMigration,
+  sourceLabel,
   sourceStorage,
 } from "../../files/migrate.ts";
 import type { S3Config } from "../../settings/model.ts";
@@ -98,12 +99,24 @@ async function migrate(
       aux: app.logs.db,
       data: app.db,
       storage,
-      s3: app.settings.s3,
+      s3: () => app.settings.s3,
       progress: (s) => console.log(line(s)),
     });
 
+  const source: MigrationSource = from === "s3" ? { kind: "s3", s3: fromS3(c) } : { kind: "local" };
+  const deleteSource = c.flags["delete-source"] === true;
+  const dryRun = c.flags["dry-run"] === true;
   const active = mig.active();
   if (active) {
+    // Never take over a job that is not the one asked for: following it would run its own source and its own
+    // delete-source, and a dry run must not run anything at all.
+    if (dryRun || active.from !== sourceLabel(source) || active.deleteSource !== deleteSource) {
+      console.error(
+        `error: a files migration is already running (${active.from} -> ${active.to}, delete source: ` +
+          `${active.deleteSource}). Wait for it, or cancel it, before ${dryRun ? "a dry run" : "starting another"}.`,
+      );
+      return 1;
+    }
     console.log(`a files migration is already running (${active.from} -> ${active.to}): following it`);
     // Run it here when its owner is gone; else watch the row until it ends.
     while (!(await run(active.id))) {
@@ -117,8 +130,7 @@ async function migrate(
     return end.status === "done" ? 0 : 1;
   }
 
-  const source: MigrationSource = from === "s3" ? { kind: "s3", s3: fromS3(c) } : { kind: "local" };
-  if (c.flags["dry-run"] === true) {
+  if (dryRun) {
     const plan = await planMigration(sourceStorage(source, storage), storage.target);
     console.log(
       `dry run: ${plan.total} file(s) at the source, ${plan.toCopy} to copy (${plan.bytes} bytes), ` +
@@ -126,7 +138,7 @@ async function migrate(
     );
     return 0;
   }
-  const job = await mig.create({ from: source, deleteSource: c.flags["delete-source"] === true });
+  const job = await mig.create({ from: source, deleteSource });
   console.log(`files migration ${job.id}: ${job.from} -> ${job.to}`);
   await run(job.id);
   const end = mig.get(job.id)!;

@@ -80,3 +80,35 @@ Deno.test("multipartBody streams spooled files back as a parsable form", async (
     assertEquals([f.name, f.type, await f.text()], ["a%22b.txt", "text/plain", "conteúdo"]);
   });
 });
+
+/** A form of `n` text parts of `size` bytes each, generated as it is read. */
+function manyParts(n: number, size: number): { body: ReadableStream<Uint8Array>; boundary: string } {
+  const boundary = "b0undary";
+  const enc = new TextEncoder();
+  const fill = new Uint8Array(size).fill(0x61);
+  let i = 0;
+  return {
+    boundary,
+    body: new ReadableStream({
+      pull(ctl) {
+        if (i === n) {
+          ctl.enqueue(enc.encode(`--${boundary}--\r\n`));
+          return ctl.close();
+        }
+        ctl.enqueue(enc.encode(`--${boundary}\r\nContent-Disposition: form-data; name="f${i++}"\r\n\r\n`));
+        ctl.enqueue(fill);
+        ctl.enqueue(enc.encode("\r\n"));
+      },
+    }),
+  };
+}
+
+Deno.test("text parts are capped together and parts are capped in number, like Go's ReadForm", async () => {
+  // Each part is small; together they pass what one form may hold in memory.
+  const big = manyParts(50, 1 << 20);
+  await assertRejects(() => spoolMultipart(big.body, big.boundary, () => 0), Error, "form text too large");
+  const many = manyParts(1001, 1);
+  await assertRejects(() => spoolMultipart(many.body, many.boundary, () => 0), Error, "too many parts");
+  const ok = manyParts(1000, 1);
+  assertEquals([...(await spoolMultipart(ok.body, ok.boundary, () => 0)).keys()].length, 1000);
+});

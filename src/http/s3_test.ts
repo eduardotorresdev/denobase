@@ -119,3 +119,25 @@ Deno.test("POST /api/settings/test/s3 answers like PB for each filesystem", asyn
     await s3.close();
   }
 });
+
+Deno.test("a storage that fails to delete after commit is logged, never an unhandled rejection", async () => {
+  const t = await setup();
+  const logged: unknown[] = [];
+  const err = console.error;
+  console.error = (...a: unknown[]) => void logged.push(a[0]);
+  try {
+    const down = () => Promise.reject(new Error("S3 503 Slow Down"));
+    t.local.delete = down;
+    t.local.deletePrefix = down;
+    const a = await t.upload("a.txt", "x");
+    const f = new FormData();
+    f.append("anexo", new File(["y"], "b.txt", { type: "text/plain" }));
+    assertEquals((await t.call("PATCH", `/api/collections/s3_docs/records/${a.id}`, f)).status, 200);
+    assertEquals((await t.call("DELETE", `/api/collections/s3_docs/records/${a.id}`)).status, 204);
+    for (let i = 0; i < 50 && logged.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+    assertEquals(logged, ["Failed to delete files", "Failed to delete files"]);
+  } finally {
+    console.error = err;
+    await t.app.terminate();
+  }
+});

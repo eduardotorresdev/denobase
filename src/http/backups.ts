@@ -4,8 +4,29 @@ import { badRequest, forbidden } from "../core/errors.ts";
 import { verifyToken } from "../auth/jwt.ts";
 import { backupName, isZip, validKey } from "../backups/mod.ts";
 import { requireSuperuser } from "./guards.ts";
+import { serveContent } from "./serve_content.ts";
+import { boundaryOf, spoolMultipart } from "../files/spool.ts";
 
 const NAME = /^[a-z0-9_-]+\.zip$/;
+
+/** The first n bytes, read from the stream: a SpooledFile's bytes are on disk, so slice() would see none. */
+async function head(file: File, n: number): Promise<Uint8Array> {
+  const out = new Uint8Array(n);
+  let got = 0;
+  const reader = file.stream().getReader();
+  try {
+    while (got < n) {
+      const r = await reader.read();
+      if (r.done) break;
+      const take = r.value.subarray(0, n - got);
+      out.set(take, got);
+      got += take.length;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  return out.subarray(0, got);
+}
 
 /** PB backup routes. Without a pb_data dir (tests, in-memory dbs) every call answers PB's filesystem error. */
 export function backupRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
@@ -59,15 +80,19 @@ export function backupRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
     requireSuperuser(c);
     const b = fs();
     let file: File | undefined;
+    // Spooled to a temp file as it arrives: formData() would hold a multi-GB zip in memory.
+    const boundary = boundaryOf(c.req.header("Content-Type") ?? "");
     try {
-      const v = (await c.req.raw.formData()).get("file");
+      const v = boundary
+        ? (await spoolMultipart(c.req.raw.body, boundary, () => Number.MAX_SAFE_INTEGER)).get("file")
+        : null;
       if (v instanceof File) file = v;
     } catch { /* missing file below */ }
     const fail = (code: string, message: string) =>
       badRequest("An error occurred while validating the submitted data.", { file: { code, message } });
     if (!file) throw fail("validation_required", "Cannot be blank.");
     // Only the magic is sniffed in memory; the zip itself streams to the store (a file, or an S3 multipart upload).
-    if (!isZip(new Uint8Array(await file.slice(0, 4).arrayBuffer()))) {
+    if (!isZip(await head(file, 4))) {
       throw fail("validation_invalid_mime_type", `"${file.name}" mime type must be one of: application/zip.`);
     }
     if (!validKey(file.name) || await b.exists(file.name)) {
@@ -87,16 +112,18 @@ export function backupRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
     if (!v || v.collection.slug !== "_superusers") throw forbidden("Insufficient permissions to access the resource.");
     const key = c.req.param("key");
     const b = fs();
-    if (!(await b.exists(key))) throw badRequest("Missing or invalid backup file.");
-    const obj = await b.get(key);
-    if (!obj) throw badRequest("Missing or invalid backup file.");
-    return new Response(obj.body, {
-      headers: {
+    const info = await b.stat(key).catch(() => null);
+    if (!info) throw badRequest("Missing or invalid backup file.");
+    // PB serves backups through fsys.Serve (http.ServeContent): Range, Last-Modified, conditional requests.
+    return await serveContent({
+      request: c.req.raw,
+      info,
+      headers: new Headers({
         "Content-Disposition": `attachment; filename=${JSON.stringify(key)}`,
         "Content-Type": "application/zip",
         "Content-Security-Policy": "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; sandbox",
-        "Content-Length": String(obj.size),
-      },
+      }),
+      open: async (range) => (await b.get(key, { range }))?.body ?? null,
     });
   });
 

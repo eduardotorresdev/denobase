@@ -4,7 +4,7 @@ import { dbPath, runTask } from "../workers/mod.ts";
 import type { ArchiveInput } from "./tasks/archive.ts";
 import type { ExtractInput } from "./tasks/extract.ts";
 import { type BackupInfo, BackupStore, pruneBackups } from "./store.ts";
-import type { BlobObject } from "../files/storage.ts";
+import type { BlobInfo, BlobObject, BlobRange } from "../files/storage.ts";
 import type { S3Config } from "../settings/model.ts";
 import { swapDataDir, TRASH_DIR } from "./restore.ts";
 
@@ -53,8 +53,12 @@ export class Backups {
     return this.#store.exists(key);
   }
   /** The zip as a stream; null when absent. */
-  get(key: string): Promise<BlobObject | null> {
-    return this.#store.get(key);
+  get(key: string, opts?: { range?: BlobRange }): Promise<BlobObject | null> {
+    return this.#store.get(key, opts);
+  }
+  /** Size and mod time, for Range and conditional downloads; null when absent. */
+  stat(key: string): Promise<BlobInfo | null> {
+    return this.#store.stat(key);
   }
   delete(key: string): Promise<void> {
     return this.#store.delete(key);

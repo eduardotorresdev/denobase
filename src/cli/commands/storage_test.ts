@@ -90,6 +90,21 @@ Deno.test("storage migrate: a running job is followed, and taken over once its l
     aux.close();
     data.close();
 
+    // A dry run, or a run asking for something else (here: delete the source), never takes over that job.
+    const errors: string[] = [];
+    const err = console.error;
+    console.error = (s: string) => void errors.push(s);
+    try {
+      const base = ["storage", "migrate", "--from", "local", "--to", "s3", ...db];
+      assertEquals(await cli.run([...base, "--dry-run"]), 1);
+      assertEquals(await cli.run([...base, "--delete-source"]), 1);
+    } finally {
+      console.error = err;
+    }
+    assertEquals(errors.length, 2);
+    assertEquals(s3.objects.size, 0);
+    assertEquals(await keysOf(new FsStorage(`${dir}/storage`)), ["c1/r1/a.txt"]);
+
     assertEquals(await cli.run(["storage", "migrate", "--from", "local", "--to", "s3", ...db]), 0);
     assertEquals(lines[0].includes("already running"), true);
     assertEquals(s3.objects.has("c1/r1/a.txt"), true);
