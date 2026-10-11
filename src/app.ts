@@ -16,6 +16,8 @@ import { Realtime } from "./realtime/mod.ts";
 import { createStore, type Store } from "./store/mod.ts";
 import { type BlobStore, MemoryStorage } from "./files/storage.ts";
 import { CurrentStorage } from "./files/current.ts";
+import { FILES_MIGRATION_TOPIC, FilesMigrations } from "./files/migrate.ts";
+import { PROGRESS_OP } from "./files/tasks/migrate.ts";
 import { loadSettings, resolveSettings, type Settings, type SettingsPatch } from "./settings/mod.ts";
 import { bundledUi, diskUi } from "./http/ui_source.ts";
 import { McpHost } from "./mcp/host.ts";
@@ -73,6 +75,8 @@ export interface App {
    */
   readonly jobs: JobRunner;
   readonly backups: Backups | null;
+  /** Moving record files to the storage settings.s3 names now (job state in the auxiliary db). */
+  readonly filesMigration: FilesMigrations;
   /** The Hono app, for mounting next to other routes and for app.http.request in tests. */
   readonly http: Hono<AppEnv>;
   /** Web-standard handler: Deno.serve(app.fetch). */
@@ -129,6 +133,19 @@ export function createApp(opts: AppOptions): App {
       (module, input) => jobs.inWorker ? jobs.run({ module }, input) : runTask(module, input),
     )
     : null;
+  const filesMigration = new FilesMigrations({
+    aux: logs.db,
+    data: db,
+    storage: files,
+    s3: () => settings.s3,
+    launch: (id) => jobs.run({ module: MIGRATE_TASK }, { id }),
+  });
+  // The run lives in the worker, the subscribers here: progress comes back to be published on this realtime.
+  jobs.operation(
+    PROGRESS_OP,
+    (_store, state: unknown) =>
+      realtime.publish(FILES_MIGRATION_TOPIC, state, { access: ({ auth }) => auth?.collection === "_superusers" }),
+  );
   const cron = new Cron(() => settings.meta.timezone, tracer);
   cron.useRunner(jobs);
   systemJobs(cron, db, logs, settings);
@@ -156,6 +173,7 @@ export function createApp(opts: AppOptions): App {
     traces,
     cron,
     backups,
+    filesMigration,
     adminUi: opts.adminUiDir === false
       ? undefined
       : typeof opts.adminUiDir === "string"
@@ -195,6 +213,7 @@ export function createApp(opts: AppOptions): App {
     cron,
     jobs,
     backups,
+    filesMigration,
     http,
     fetch: http.fetch,
     mcp,
@@ -204,6 +223,8 @@ export function createApp(opts: AppOptions): App {
   mcp.attach(app, ctx);
   return app;
 }
+
+const MIGRATE_TASK = new URL("./files/tasks/migrate.ts", import.meta.url);
 
 /** When the saved settings last changed ('' before the first save): a cheap read to tell a settings commit apart. */
 function settingsUpdated(db: DatabaseSync): string {

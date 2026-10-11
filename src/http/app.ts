@@ -19,6 +19,8 @@ import type { Cron } from "../cron/mod.ts";
 import { cronRoutes } from "./crons.ts";
 import type { Backups } from "../backups/mod.ts";
 import { backupRoutes } from "./backups.ts";
+import type { FilesMigrations } from "../files/migrate.ts";
+import { filesMigrationRoutes } from "./files_migration.ts";
 import { withSpoolScope } from "../files/spool.ts";
 import { collectionRoutes } from "./collections.ts";
 import type { UiSource } from "./ui_source.ts";
@@ -53,6 +55,7 @@ export interface Ctx {
   cron: Cron;
   /** null without a pb_data dir: the backups API then answers PB's filesystem error. */
   backups: Backups | null;
+  filesMigration: FilesMigrations;
   /** Admin UI to serve at /_/; unset, there is no UI. */
   adminUi?: UiSource;
   /** The app's MCP (POST /api/mcp); its registry is app.mcp. */
@@ -121,6 +124,7 @@ export function createHttp(ctx: Ctx): Hono<AppEnv> {
   traceRoutes(app, ctx);
   cronRoutes(app, ctx);
   backupRoutes(app, ctx);
+  filesMigrationRoutes(app, ctx);
   collectionRoutes(app, ctx);
   statsRoutes(app, ctx);
   // /oauth/* lives outside /api: its endpoints authenticate clients and browsers themselves, never by Bearer.

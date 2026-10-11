@@ -64,6 +64,17 @@ export {
   type Storage,
 } from "./src/files/storage.ts";
 export { CurrentStorage, storageFromSettings } from "./src/files/current.ts";
+export {
+  FILES_MIGRATION_TOPIC,
+  FilesMigrations,
+  type MigrationFailure,
+  type MigrationPlan,
+  type MigrationSource,
+  type MigrationState,
+  type MigrationStatus,
+  planMigration,
+  runMigration,
+} from "./src/files/migrate.ts";
 export { MULTIPART_THRESHOLD, S3Storage } from "./src/files/s3/storage.ts";
 export { S3Client, S3Error } from "./src/files/s3/client.ts";
 export { Cron, type CronTrigger, type Job, Schedule } from "./src/cron/mod.ts";
@@ -130,6 +141,7 @@ export {
   serve,
   serveCommand,
   type ServeOptions,
+  storageCommand,
   testData,
   testDataCommand,
   UsageError,

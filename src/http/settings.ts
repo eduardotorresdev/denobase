@@ -39,10 +39,13 @@ export function settingsRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
     const next = mergeSettings<Settings>(structuredClone(ctx.settings), body);
     const errs = validateSettings(next);
     if (Object.keys(errs).length) throw badRequest("An error occurred while saving the new settings.", errs);
+    const prevS3 = structuredClone(ctx.settings.s3);
     saveSettings(ctx.db, next);
     // Same object everywhere (ctx, app.settings): routes and jobs read the new values from now on.
     Object.assign(ctx.settings, next);
     for (const fn of ctx.onSettingsChange) fn(ctx.settings);
+    // The storage files lived on until now: what the UI offers to migrate from.
+    await ctx.filesMigration.proposeFrom(prevS3, ctx.settings.s3);
     return c.json(publicSettings(ctx.settings));
   });
 
