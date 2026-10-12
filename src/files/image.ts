@@ -1,6 +1,7 @@
 import { convertIndexedToRgb, decode as decodePng, encode as encodePng } from "fast-png";
 import jpeg from "jpeg-js";
 import { GifReader, GifWriter } from "omggif";
+import { Unzlib } from "fflate";
 
 /**
  * The image half of PB's filesystem.CreateThumb (disintegration/imaging): decode by magic bytes (first frame of a
@@ -104,6 +105,12 @@ export async function decodeImage(b: Uint8Array): Promise<Rgba> {
     }
     case "gif": {
       const r = new GifReader(b);
+      // omggif sizes its index buffer from the frame descriptor, not the screen the guard checked; Go's image/gif
+      // refuses a frame past the screen bounds the same way.
+      const f = r.frameInfo(0);
+      if (f.x + f.width > r.width || f.y + f.height > r.height) {
+        throw new Error("gif: frame bounds larger than image bounds");
+      }
       const data = new Uint8Array(r.width * r.height * 4);
       r.decodeAndBlitFrameRGBA(0, data);
       return { width: r.width, height: r.height, data };
@@ -117,29 +124,103 @@ export async function decodeImage(b: Uint8Array): Promise<Rgba> {
   }
 }
 
-function fromPng(b: Uint8Array): Rgba {
-  const png = decodePng(b);
-  const { width, height } = png;
-  let src: ArrayLike<number> = png.data;
-  let channels = png.channels;
-  let shift = png.depth === 16 ? 8 : 0;
-  if (png.palette) {
-    src = convertIndexedToRgb(png);
-    channels = png.palette[0]?.length ?? 3;
-    shift = 0;
+/** Chunks fast-png needs; the rest (iCCP above all, which it inflates with no limit) is dropped before decoding. */
+const PNG_KEEP = new Set(["IHDR", "PLTE", "tRNS", "IDAT", "IEND"]);
+const ADAM7 = [[0, 0, 8, 8], [4, 0, 8, 8], [0, 4, 4, 8], [2, 0, 4, 4], [0, 2, 2, 4], [1, 0, 2, 2], [0, 1, 1, 2]];
+const PNG_CHANNELS: Record<number, number> = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 };
+
+/**
+ * Walks the chunks, keeps only what decoding needs and inflates the IDAT stream once with a cap at the size the
+ * header implies, so a zlib bomb is refused before fast-png (which inflates without a limit) ever sees it.
+ */
+export function sanitizePng(b: Uint8Array): { png: Uint8Array; key: number[] | null } {
+  if (b.length < 33) throw new Error("png: truncated");
+  const width = u32be(b, 16), height = u32be(b, 20), depth = b[24], channels = PNG_CHANNELS[b[25]], interlace = b[28];
+  if (!channels) throw new Error("png: invalid color type");
+  const rowBytes = (w: number) => (w > 0 ? 1 + Math.ceil((w * channels * depth) / 8) : 0);
+  let expected = 0;
+  if (interlace === 1) {
+    for (const [x, y, dx, dy] of ADAM7) {
+      const pw = Math.ceil((width - x) / dx), ph = Math.ceil((height - y) / dy);
+      if (pw > 0 && ph > 0) expected += ph * rowBytes(pw);
+    }
+  } else expected = height * rowBytes(width);
+  let inflated = 0;
+  const z = new Unzlib((chunk) => {
+    inflated += chunk.length;
+    if (inflated > expected) throw new Error("png: image data larger than its header declares");
+  });
+  const parts: Uint8Array[] = [b.subarray(0, 8)];
+  let key: number[] | null = null;
+  let at = 8;
+  while (at + 12 <= b.length) {
+    const len = u32be(b, at);
+    const type = ascii(b, at + 4, 4);
+    const end = at + 12 + len;
+    if (end > b.length) throw new Error("png: truncated chunk");
+    // A gray or truecolor tRNS is a color key read here: fast-png validates it as if it were per-pixel alpha.
+    if (type === "tRNS" && (channels === 1 || channels === 3)) {
+      if (len >= channels * 2) key = Array.from({ length: channels }, (_, k) => u16be(b, at + 8 + k * 2));
+    } else if (PNG_KEEP.has(type)) parts.push(b.subarray(at, end));
+    if (type === "IDAT") z.push(b.subarray(at + 8, at + 8 + len));
+    at = end;
+    if (type === "IEND") break;
   }
-  const scale = !png.palette && png.depth < 8 ? 255 / ((1 << png.depth) - 1) : 1;
-  const data = new Uint8Array(width * height * 4);
-  for (let i = 0, o = 0; o < data.length; i += channels, o += 4) {
-    const v = (k: number) => Math.round((src[i + k] >> shift) * scale);
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let o = 0;
+  for (const p of parts) out.set(p, (o += p.length) - p.length);
+  return { png: out, key };
+}
+
+function fromPng(b: Uint8Array): Rgba {
+  const clean = sanitizePng(b);
+  const png = decodePng(clean.png);
+  const { width, height, depth } = png;
+  const n = width * height;
+  const data = new Uint8Array(n * 4);
+  if (png.palette) {
+    // convertIndexedToRgb unpacks sub-byte indices and applies tRNS itself.
+    const src = convertIndexedToRgb(png);
+    const ch = png.palette[0]?.length ?? 3;
+    for (let i = 0, o = 0; o < data.length; i += ch, o += 4) {
+      data[o] = src[i];
+      data[o + 1] = src[i + 1];
+      data[o + 2] = src[i + 2];
+      data[o + 3] = ch === 4 ? src[i + 3] : 255;
+    }
+    return { width, height, data };
+  }
+  const channels = png.channels;
+  if (depth < 8 && b[28] === 1) {
+    // fast-png treats an interlaced sub-byte image as one byte per sample and loses the pixels; the original is served.
+    throw new Error("png: interlaced images below 8 bits per sample are not supported");
+  }
+  // Raw samples at the stored depth: fast-png leaves rows of sub-byte samples packed, padded to a byte per row.
+  const raw = png.data;
+  const rowBits = width * channels * depth;
+  const rowStride = Math.ceil(rowBits / 8);
+  const sample = depth < 8
+    ? (p: number, k: number) => {
+      const bit = (p % width) * channels * depth + k * depth;
+      const byte = raw[Math.floor(p / width) * rowStride + (bit >> 3)];
+      return (byte >> (8 - depth - (bit & 7))) & ((1 << depth) - 1);
+    }
+    : (p: number, k: number) => raw[p * channels + k];
+  const max = (1 << depth) - 1;
+  const to8 = (v: number) => (depth === 16 ? v >> 8 : depth < 8 ? Math.round((v * 255) / max) : v);
+  // tRNS on a gray or truecolor image keys one color (raw sample values) as fully transparent, as Go's image/png does.
+  const key = clean.key;
+  for (let p = 0, o = 0; p < n; p++, o += 4) {
     if (channels <= 2) {
-      data[o] = data[o + 1] = data[o + 2] = v(0);
-      data[o + 3] = channels === 2 ? v(1) : 255;
+      const g = sample(p, 0);
+      data[o] = data[o + 1] = data[o + 2] = to8(g);
+      data[o + 3] = channels === 2 ? to8(sample(p, 1)) : key && g === key[0] ? 0 : 255;
     } else {
-      data[o] = v(0);
-      data[o + 1] = v(1);
-      data[o + 2] = v(2);
-      data[o + 3] = channels === 4 ? v(3) : 255;
+      const r = sample(p, 0), g = sample(p, 1), bl = sample(p, 2);
+      data[o] = to8(r);
+      data[o + 1] = to8(g);
+      data[o + 2] = to8(bl);
+      data[o + 3] = channels === 4 ? to8(sample(p, 3)) : key && r === key[0] && g === key[1] && bl === key[2] ? 0 : 255;
     }
   }
   return { width, height, data };

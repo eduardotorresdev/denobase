@@ -83,6 +83,12 @@ export class Thumbs {
       const bytes = await readAll(obj.body);
       const thumb = await renderThumb(bytes, obj.type.split(";")[0].trim(), size);
       await storage.put(thumbKey, thumb.bytes, { type: thumb.type });
+      // The file or its record may have been deleted while this rendered: its thumbs_ cleanup has then already run
+      // and this put would be left orphaned, so the generation cleans up after itself.
+      if (!(await storage.stat(originalKey))) {
+        await storage.delete(thumbKey);
+        throw new Error("original file not found");
+      }
     } finally {
       this.#release();
     }

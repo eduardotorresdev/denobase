@@ -1,5 +1,6 @@
 import { assert, assertEquals, assertRejects } from "@std/assert";
 import { decode as decodePng, encode as encodePng } from "fast-png";
+import { zlibSync } from "fflate";
 import { pngOf, twoTone } from "./testkit.ts";
 import jpeg from "jpeg-js";
 import encodeWebp from "@jsquash/webp/encode.js";
@@ -132,6 +133,7 @@ Deno.test("Thumbs shares one generation per key and runs at most two at once", a
   const storage = new MemoryStorage();
   let gets = 0, live = 0, peak = 0;
   const slow: typeof storage = Object.create(storage);
+  slow.stat = (key) => storage.stat(key);
   slow.get = async (key, opts) => {
     gets++;
     live++;
@@ -173,4 +175,139 @@ Deno.test("Thumbs gives up waiting for a slot after maxWait", async () => {
   await assertRejects(() => thumbs.create(blocked, "b", "tb", "10x10"), Error, "timed out");
   release();
   await assertRejects(() => first, Error, "not found");
+});
+
+// --- hand-built PNG and GIF fixtures for the decoder guards ---
+
+const CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
+  let c = n;
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+  return c >>> 0;
+});
+function crc32(b: Uint8Array): number {
+  let c = 0xffffffff;
+  for (const v of b) c = CRC_TABLE[(c ^ v) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+function chunk(type: string, body: Uint8Array): Uint8Array {
+  const out = new Uint8Array(12 + body.length);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, body.length);
+  out.set(new TextEncoder().encode(type), 4);
+  out.set(body, 8);
+  dv.setUint32(8 + body.length, crc32(out.subarray(4, 8 + body.length)));
+  return out;
+}
+function rawPng(
+  w: number,
+  h: number,
+  depth: number,
+  colorType: number,
+  idat: Uint8Array,
+  extra: Uint8Array[] = [],
+): Uint8Array {
+  const ihdr = new Uint8Array(13);
+  const dv = new DataView(ihdr.buffer);
+  dv.setUint32(0, w);
+  dv.setUint32(4, h);
+  ihdr.set([depth, colorType, 0, 0, 0], 8);
+  const parts = [
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr),
+    ...extra,
+    chunk("IDAT", idat),
+    chunk("IEND", new Uint8Array()),
+  ];
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let o = 0;
+  for (const p of parts) out.set(p, (o += p.length) - p.length);
+  return out;
+}
+/** Rows with filter byte 0 prepended, zlib-compressed. */
+const idatOf = (rows: number[][]) => zlibSync(new Uint8Array(rows.flatMap((r) => [0, ...r])));
+
+Deno.test("a 1-bit grayscale PNG is unpacked, not read a byte per pixel", async () => {
+  // 16x2: left 8 pixels white, right 8 black, packed 8 pixels per byte.
+  const png = rawPng(16, 2, 1, 0, idatOf([[0xff, 0x00], [0xff, 0x00]]));
+  const img = await decodeImage(png);
+  assertEquals([img.width, img.height], [16, 2]);
+  assertEquals(px(img, 0, 1), [255, 255, 255, 255]);
+  assertEquals(px(img, 7, 0), [255, 255, 255, 255]);
+  assertEquals(px(img, 8, 0), [0, 0, 0, 255]);
+  assertEquals(px(img, 15, 1), [0, 0, 0, 255]);
+  // 2-bit, 3 pixels per row (row padded to a byte): levels 3, 1, 0.
+  const two = await decodeImage(rawPng(3, 1, 2, 0, idatOf([[0b11_01_00_00]])));
+  assertEquals([px(two, 0, 0)[0], px(two, 1, 0)[0], px(two, 2, 0)[0]], [255, 85, 0]);
+});
+
+Deno.test("tRNS keys a color transparent on truecolor and grayscale PNGs", async () => {
+  const rgb = rawPng(2, 1, 8, 2, idatOf([[255, 255, 255, 10, 20, 30]]), [
+    chunk("tRNS", new Uint8Array([0, 255, 0, 255, 0, 255])),
+  ]);
+  const a = await decodeImage(rgb);
+  assertEquals(px(a, 0, 0)[3], 0);
+  assertEquals(px(a, 1, 0), [10, 20, 30, 255]);
+  const gray = await decodeImage(rawPng(2, 1, 8, 0, idatOf([[7, 8]]), [chunk("tRNS", new Uint8Array([0, 7]))]));
+  assertEquals([px(gray, 0, 0)[3], px(gray, 1, 0)], [0, [8, 8, 8, 255]]);
+  const bit = await decodeImage(rawPng(8, 1, 1, 0, idatOf([[0b1010_1010]]), [chunk("tRNS", new Uint8Array([0, 0]))]));
+  assertEquals([px(bit, 0, 0), px(bit, 1, 0)[3]], [[255, 255, 255, 255], 0]);
+});
+
+Deno.test("a PNG whose IDAT inflates past its header is refused; iCCP is never inflated", async () => {
+  const bomb = rawPng(1, 1, 8, 2, zlibSync(new Uint8Array(32 * 1024 * 1024), { level: 9 }));
+  assert(bomb.length < 100_000);
+  await assertRejects(() => decodeImage(bomb), Error, "larger than its header");
+  const iccp = new Uint8Array([...new TextEncoder().encode("x\0\0"), ...zlibSync(new Uint8Array(32 * 1024 * 1024))]);
+  const img = await decodeImage(rawPng(1, 1, 8, 2, idatOf([[1, 2, 3]]), [chunk("iCCP", iccp)]));
+  assertEquals(px(img, 0, 0), [1, 2, 3, 255]);
+});
+
+Deno.test("a GIF frame larger than its logical screen is refused before omggif allocates it", async () => {
+  const gif = new Uint8Array([
+    ...new TextEncoder().encode("GIF89a"),
+    1,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0, // 1x1 screen, no global palette
+    0x2c,
+    0,
+    0,
+    0,
+    0,
+    0x30,
+    0x75,
+    0x30,
+    0x75,
+    0, // image descriptor: 30000x30000, no local palette
+    2,
+    2,
+    0x4c,
+    0x01,
+    0, // tiny LZW stream
+    0x3b,
+  ]);
+  assertEquals(imageSize(gif), { width: 1, height: 1 });
+  await assertRejects(() => decodeImage(gif), Error, "frame bounds");
+});
+
+Deno.test("a thumb generated while its original is deleted does not outlive it", async () => {
+  const storage = new MemoryStorage();
+  await storage.put("c/r/a.png", pngOf(twoTone(20, 20, "lr")), { type: "image/png" });
+  const racing: typeof storage = Object.create(storage);
+  racing.stat = (key) => storage.stat(key);
+  racing.put = (key, body, meta) => storage.put(key, body, meta);
+  racing.delete = (key) => storage.delete(key);
+  racing.get = async (key, opts) => {
+    const obj = await storage.get(key, opts);
+    // The record update commits and its cleanup runs between the read and the put.
+    await storage.delete("c/r/a.png");
+    await storage.deletePrefix("c/r/thumbs_a.png/");
+    return obj;
+  };
+  const thumbs = new Thumbs(1);
+  await assertRejects(() => thumbs.create(racing, "c/r/a.png", "c/r/thumbs_a.png/10x10_a.png", "10x10"));
+  assertEquals(await storage.stat("c/r/thumbs_a.png/10x10_a.png"), null);
 });
