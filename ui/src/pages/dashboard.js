@@ -1,6 +1,6 @@
 import { formatTime, toDate, wallClock } from "../time.js";
 import { badge, errorState, formatBytes, formatDate, loading, onUnmount, page, pbDate, stat } from "../ui.js";
-import { ERRORS_FILTER, levelBadge, showLog, withErrors } from "./logs.js";
+import { levelBadge, showLog } from "./logs.js";
 import { tracesCard } from "./traces.js";
 
 const STATS_EVERY_MS = 10_000;
@@ -255,43 +255,19 @@ function trafficChart(rows, lat) {
   return box;
 }
 
-/** avg / p90 / p99 of a list of durations (nearest-rank). */
-function summarize(ms) {
-  if (!ms.length) return null;
-  const v = [...ms].sort((a, b) => a - b);
-  const q = (p) => v[Math.min(v.length - 1, Math.ceil(p * v.length) - 1)];
-  return { avg: v.reduce((a, b) => a + b, 0) / v.length, p90: q(0.9), p99: q(0.99) };
-}
-
 const fmtMs = (v) => (v == null ? "–" : `${v.toFixed(1)}ms`);
 
 function traffic() {
   return asyncCard(
     "Requests",
     async () => {
-      const since = `created>="${pbDate(new Date(Date.now() - 864e5))}"`;
-      const [all, errs, recent] = await Promise.all([
-        app.pb.logs.getStats({ filter: since, requestKey: "dash-stats-all" }),
-        app.pb.logs.getStats({ filter: `${since} && (${ERRORS_FILTER})`, requestKey: "dash-stats-err" }),
-        app.pb.logs.getList(1, 1000, {
-          filter: `${since} && data.execTime>0`,
-          fields: "created,data",
-          skipTotal: true,
-          requestKey: "dash-latency",
-        }),
-      ]);
-      const rows = last24h(withErrors(all, errs));
-      const byHour = new Map();
-      const every = [];
-      for (const l of recent.items) {
-        const ms = Number(l.data?.execTime) || 0;
-        const h = String(l.created).slice(0, 13);
-        if (!byHour.has(h)) byHour.set(h, []);
-        byHour.get(h).push(ms);
-        every.push(ms);
-      }
-      const lat = rows.map((r) => summarize(byHour.get(String(r.date).slice(0, 13)) || []));
-      const all24 = summarize(every);
+      // One server pass, cached 30s: totals, errors and latency per hour (no raw rows shipped to compute them).
+      const { hours, overall: all24 } = await app.pb.send("/api/_denobase/traffic", {
+        method: "GET",
+        requestKey: "dash-traffic",
+      });
+      const rows = last24h(hours);
+      const lat = rows.map((r) => (r.avg == null ? null : r));
       const total = rows.reduce((a, r) => a + r.total, 0);
       const bad = rows.reduce((a, r) => a + Math.min(r.errors || 0, r.total), 0);
       const rate = total ? (bad / total) * 100 : 0;
@@ -387,9 +363,6 @@ export function render(_route) {
       if (!err?.isAbort) s.error = err;
     }
   };
-  loadStats();
-  timer = setInterval(loadStats, STATS_EVERY_MS);
-
   const grid = t.div({ className: "dash-grid" });
   const fill = () => {
     loadStats();
@@ -402,5 +375,8 @@ export function render(_route) {
     kpiRow,
     grid,
   );
+  // A render the router discards is never mounted, so onUnmount never fires for it: the poll stops itself once the
+  // element is not in the document.
+  timer = setInterval(() => (el.isConnected ? loadStats() : stop()), STATS_EVERY_MS);
   return onUnmount(el, stop);
 }

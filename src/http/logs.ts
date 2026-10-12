@@ -3,6 +3,7 @@ import type { AppEnv, Ctx } from "./app.ts";
 import { ApiError, notFound } from "../core/errors.ts";
 import { LEVEL } from "../logs/mod.ts";
 import { requireSuperuser } from "./guards.ts";
+import { parseFields, pickFields } from "../query/helpers.ts";
 import { clientIp } from "./routes.ts";
 import { redactQuery } from "../telemetry/instrument/http.ts";
 
@@ -80,7 +81,15 @@ export function logsRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
   app.use("/api/logs/*", async (c, next) => (requireSuperuser(c), await next()));
   app.get("/api/logs", (c) => {
     const q = c.req.query();
-    return c.json(ctx.logs.list({ filter: q.filter, sort: q.sort, page: int(q.page), perPage: int(q.perPage) }));
+    const out = ctx.logs.list({
+      filter: q.filter,
+      sort: q.sort,
+      page: int(q.page),
+      perPage: int(q.perPage),
+      skipTotal: ["1", "t", "true"].includes((q.skipTotal ?? "").toLowerCase()),
+    });
+    const tree = q.fields ? parseFields(q.fields) : null;
+    return c.json(tree ? { ...out, items: out.items.map((l) => pickFields(l as never, tree)) } : out);
   });
   app.delete("/api/logs", (c) => {
     ctx.logs.truncate();

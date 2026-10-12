@@ -59,10 +59,24 @@ function tracesSummary(ctx: Ctx) {
   return value;
 }
 
-/** GET /api/_denobase/stats, superuser-only. */
+/** The dashboard's 24h request traffic, scanned at most once per SUMMARY_TTL_MS however often it is opened. */
+const traffics = new WeakMap<object, { at: number; value: ReturnType<Ctx["logs"]["traffic"]> }>();
+export function trafficPayload(ctx: Ctx) {
+  const hit = traffics.get(ctx.logs);
+  if (hit && performance.now() - hit.at < SUMMARY_TTL_MS) return hit.value;
+  const value = ctx.logs.traffic(new Date(Date.now() - 86_400_000));
+  traffics.set(ctx.logs, { at: performance.now(), value });
+  return value;
+}
+
+/** GET /api/_denobase/stats and /api/_denobase/traffic, superuser-only. */
 export function statsRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
   app.get("/api/_denobase/stats", (c) => {
     requireSuperuser(c);
     return c.json(statsPayload(ctx));
+  });
+  app.get("/api/_denobase/traffic", (c) => {
+    requireSuperuser(c);
+    return c.json(trafficPayload(ctx));
   });
 }

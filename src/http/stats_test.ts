@@ -24,8 +24,8 @@ async function setup() {
   );
   const suToken = await tokenFor(db, "_superusers", su);
   const userToken = await tokenFor(db, "st_users", user);
-  const get = async (token: string) => {
-    const r = await app.http.request("/api/_denobase/stats", { headers: token ? { Authorization: token } : {} });
+  const get = async (token: string, path = "/api/_denobase/stats") => {
+    const r = await app.http.request(path, { headers: token ? { Authorization: token } : {} });
     return { status: r.status, json: await r.json() };
   };
   return { get, suToken, userToken };
@@ -35,6 +35,16 @@ Deno.test("stats: 401 without auth, 403 for a regular user", async () => {
   const t = await setup();
   assertEquals((await t.get("")).status, 401);
   assertEquals((await t.get(t.userToken)).status, 403);
+  assertEquals((await t.get("", "/api/_denobase/traffic")).status, 401);
+  assertEquals((await t.get(t.userToken, "/api/_denobase/traffic")).status, 403);
+});
+
+Deno.test("traffic: superuser gets the 24h hours and overall latency", async () => {
+  const t = await setup();
+  const r = await t.get(t.suToken, "/api/_denobase/traffic");
+  assertEquals(r.status, 200);
+  assert(Array.isArray(r.json.hours));
+  assertEquals(Object.keys(r.json.overall), ["avg", "p90", "p99"]);
 });
 
 Deno.test("stats: superuser gets host, process and db figures without any path", async () => {

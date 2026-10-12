@@ -115,6 +115,15 @@ Deno.test("logs: every request is logged, errors at level 8, with PB's list/filt
   assertEquals((await t.call("GET", "/api/logs")).json.totalItems, 0);
 });
 
+Deno.test("logs list: skipTotal answers -1 totals and fields picks item keys, like PB", async () => {
+  const t = await setup();
+  await t.call("GET", "/api/health");
+  const r = (await t.call("GET", "/api/logs?skipTotal=1&fields=created,data")).json;
+  assertEquals([r.totalItems, r.totalPages], [-1, -1]);
+  assert(r.items.length >= 1);
+  assertEquals(Object.keys(r.items[0]), ["created", "data"]);
+});
+
 Deno.test("cron: PB expressions and macros, UTC schedule, jobs API", async () => {
   const s = new Schedule("*/15 9-17 * * 1-5");
   assert(s.isDue(new Date("2026-10-05T09:30:00Z"))); // Monday
