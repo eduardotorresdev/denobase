@@ -5,6 +5,7 @@ import { defineCollection } from "../core/define.ts";
 import { collectionId, registerCollections } from "../core/registry.ts";
 import { superusers } from "../core/superusers.ts";
 import { MemoryStorage } from "../files/storage.ts";
+import { beforeCommit, tx } from "../core/db.ts";
 import { normalizeName } from "../files/name.ts";
 import { dbWith, tokenFor } from "../testing/mod.ts";
 
@@ -258,4 +259,39 @@ Deno.test("uploads spool to disk and the spool goes after success, validation er
   r = await t.send("POST", "/api/batch", form);
   assertEquals(r.status, 400);
   assertEquals(await spoolDirs(), before);
+});
+
+Deno.test("a failed save or commit leaves no orphan uploads; replaced files stay until a commit succeeds", async () => {
+  const t = await setup();
+  const docs = t.app.store.collection(fl_docs);
+  const keys = () => [...t.storage.files.keys()];
+  const failCommit = (fn: () => Promise<unknown>) =>
+    tx(t.db, async () => {
+      await fn();
+      await beforeCommit(t.db, "fail", () => {
+        throw new Error("commit failed");
+      });
+    }).then(() => assert(false), (e) => assertEquals((e as Error).message, "commit failed"));
+
+  // Create: the upload happened, the commit failed, the file is gone and no row exists.
+  await failCommit(() => docs.create({ titulo: "x", anexos: [txt("a.txt")] } as never));
+  assertEquals(keys(), []);
+  assertEquals(await docs.count(), 0);
+
+  // The row write itself failing (a unique id clash) cleans up too.
+  const first = await docs.create({ titulo: "y", anexos: [txt("a.txt")] } as never);
+  const dir = `${collectionId(fl_docs)}/${first.id}/`;
+  const kept = keys();
+  assertEquals(kept.length, 1);
+  await docs.create({ id: first.id, anexos: [txt("b.txt")] } as never).then(() => assert(false), () => {});
+  assertEquals(keys(), kept);
+
+  // Update replacing the file: the new upload goes, the old one stays (the row still points at it).
+  await failCommit(() => docs.update(first.id, { anexos: [txt("c.txt")] } as never));
+  assertEquals(keys(), kept);
+  assertEquals((await docs.get(first.id) as Record<string, unknown>).anexos, (first as Record<string, unknown>).anexos);
+
+  // A successful replace drops the old file only now.
+  const next = await docs.update(first.id, { anexos: [txt("d.txt")] } as never) as Record<string, unknown>;
+  assertEquals(keys(), [dir + (next.anexos as string[])[0]]);
 });

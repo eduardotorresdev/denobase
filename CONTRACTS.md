@@ -57,6 +57,8 @@ Frozen signatures; stubs throw `notImplemented`. Change a signature only with th
 - Writes run hooks, zod validation (`fieldSchema` per field, then `CollectionConfig.schema`), unique/relation checks and
   realtime events, whichever surface called them (HTTP, store, factories).
 - Realtime events leave only after commit (`afterCommit`); a delete's are built before the row goes.
+- Side effects outside the db made inside a tx are undone through `afterRollback` (runs when the level or any level
+  above it rolls back, commit failure included): a write's new uploads are deleted that way, as in PB's FileField.
 - Views are read-only (`400 Unsupported collection type.`) and recreated from the snapshot after every migration batch.
 - REST and realtime answer exactly like PocketBase (upstream source: github.com/pocketbase/pocketbase v0.39.10): status,
   message, data, framing.
