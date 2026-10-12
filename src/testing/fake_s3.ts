@@ -45,11 +45,11 @@ export interface FakeS3 {
   close(): Promise<void>;
 }
 
-function xmlError(status: number, code: string, message: string): Response {
+function xmlError(status: number, code: string, message: string, extra = ""): Response {
   return new Response(
     `<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>${code}</Code><Message>${
       xmlEscape(message)
-    }</Message></Error>`,
+    }</Message>${extra}</Error>`,
     { status, headers: { "content-type": "application/xml" } },
   );
 }
@@ -84,7 +84,10 @@ export function startFakeS3(opts: FakeS3Options = {}): FakeS3 {
     if (!m) return xmlError(403, "AccessDenied", "missing or malformed SigV4 authorization");
     const [, key, , reg, signedHeaders, sig] = m;
     if (key !== accessKey) return xmlError(403, "InvalidAccessKeyId", "unknown access key");
-    if (reg !== region) return xmlError(400, "AuthorizationHeaderMalformed", `region must be ${region}`);
+    if (reg !== region) {
+      // Like AWS, the answer names the region the bucket lives in.
+      return xmlError(400, "AuthorizationHeaderMalformed", `region must be ${region}`, `<Region>${region}</Region>`);
+    }
     const date = req.headers.get("x-amz-date") ?? "";
     const payloadHash = req.headers.get("x-amz-content-sha256") ?? "";
     if (payloadHash !== "UNSIGNED-PAYLOAD") {

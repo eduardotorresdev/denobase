@@ -120,6 +120,60 @@ Deno.test("POST /api/settings/test/s3 answers like PB for each filesystem", asyn
   }
 });
 
+Deno.test("POST /api/_denobase/s3/check walks a draft step by step and says what to fix", async () => {
+  const s3 = startFakeS3({ region: "eu-west-1" });
+  const t = await setup();
+  const check = (s3cfg: object, filesystem = "backups") =>
+    t.call("POST", "/api/_denobase/s3/check", { filesystem, s3: s3cfg });
+  const statuses = (r: { json: { steps: { id: string; status: string }[] } }) =>
+    r.json.steps.map((x) => `${x.id}:${x.status}`).join(" ");
+  try {
+    let r = await check(s3.config);
+    assertEquals(r.status, 200);
+    assertEquals(r.json.ok, true);
+    assertEquals(statuses(r), "connect:ok auth:ok bucket:ok write:ok read:ok cleanup:ok");
+    assertEquals(s3.objects.size, 0); // the probe never stays
+    // Nothing was saved: a draft check leaves the settings alone.
+    assertEquals((await t.call("GET", "/api/settings")).json.backups.s3.enabled, false);
+
+    r = await check({ ...s3.config, region: "us-east-1" });
+    assertEquals([r.json.ok, r.json.suggest], [false, { region: "eu-west-1" }]);
+    assertEquals(statuses(r), "connect:ok auth:fail bucket:skip write:skip read:skip cleanup:skip");
+
+    r = await check({ ...s3.config, secret: "bad" });
+    assertEquals(r.json.steps[1].code, "SignatureDoesNotMatch");
+
+    r = await check({ ...s3.config, bucket: "nope" });
+    assertEquals(statuses(r), "connect:ok auth:ok bucket:fail write:skip read:skip cleanup:skip");
+
+    s3.failWhen = (q) => (q.method === "PUT" ? 500 : undefined);
+    r = await check(s3.config);
+    assertEquals(statuses(r), "connect:ok auth:ok bucket:ok write:fail read:skip cleanup:skip");
+    s3.failWhen = undefined;
+
+    // A host without DNS for bucket subdomains: connect fails and path style is suggested.
+    r = await check({ ...s3.config, endpoint: "http://localhost:1", forcePathStyle: false });
+    assertEquals([r.json.steps[0].status, r.json.suggest], ["fail", { forcePathStyle: true }]);
+
+    r = await check({ ...s3.config, endpoint: "https://<account>.example.com" });
+    assertEquals([r.status, r.json.steps[0].code], [200, "InvalidEndpoint"]);
+
+    // The saved secret fills an empty one only for the key it was saved with, and only for its filesystem.
+    await t.call("PATCH", "/api/settings", { backups: { s3: s3.config } });
+    assertEquals((await check({ ...s3.config, secret: "" })).json.ok, true);
+    r = await check({ ...s3.config, secret: "", accessKey: "OTHER" });
+    assertEquals([r.status, r.json.data.secret.code], [400, "validation_required"]);
+    assertEquals((await check({ ...s3.config, secret: "" }, "storage")).status, 400);
+
+    assertEquals((await check(s3.config, "other")).json.data.filesystem.code, "validation_in_invalid");
+    const anon = await t.call("POST", "/api/_denobase/s3/check", { filesystem: "storage", s3: s3.config }, "");
+    assertEquals(anon.status, 401);
+  } finally {
+    await t.app.terminate();
+    await s3.close();
+  }
+});
+
 Deno.test("a storage that fails to delete after commit is logged, never an unhandled rejection", async () => {
   const t = await setup();
   const logged: unknown[] = [];

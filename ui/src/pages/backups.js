@@ -14,6 +14,7 @@ import {
 } from "../ui.js";
 import { humanizeCron } from "../cron.js";
 import { scheduleField } from "../schedule.js";
+import { storageEditor, storageIcon } from "../s3connect.js";
 
 /** Backups: list, create, upload, download, restore, delete (PB backup routes). */
 export function render(_route) {
@@ -323,10 +324,16 @@ export function render(_route) {
         ),
         field(
           "Storage",
-          t.div({
-            className: "muted",
-            textContent: cfg.s3?.enabled ? `S3 · ${cfg.s3.bucket}` : "Local (pb_data/backups)",
-          }),
+          t.div(
+            { className: "row" },
+            t.span({ className: "muted", textContent: storageLabel() }),
+            t.button({
+              type: "button",
+              className: "btn btn-xs btn-ghost",
+              textContent: "Change...",
+              onclick: () => (close(), openStorage()),
+            }),
+          ),
         ),
         () => f.error ? t.div({ className: "alert alert-danger", textContent: f.error }) : null,
         t.div(
@@ -343,10 +350,96 @@ export function render(_route) {
       ), { title: "Automatic backups", size: "sm" });
   }
 
+  const storageLabel = () => {
+    const s3 = settings().s3;
+    return s3?.enabled ? `S3 · ${s3.bucket}` : "Local disk";
+  };
+
+  const PENCIL =
+    '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" ' +
+    'stroke-linejoin="round" aria-hidden="true"><path d="M11 2.5l2.5 2.5L5.5 13H3v-2.5z"/><path d="M9.5 4l2.5 2.5"/></svg>';
+
+  function storageCta() {
+    return t.button(
+      {
+        type: "button",
+        className: "btn btn-sm storage-cta",
+        title: "Edit where backups are stored",
+        onclick: () => openStorage(),
+      },
+      t.span({ className: "auto-backup-icon", innerHTML: () => storageIcon(!!settings().s3?.enabled) }),
+      t.span({ className: "storage-cta-label", textContent: "Storage" }),
+      t.span({ className: "storage-cta-value", textContent: storageLabel }),
+      t.span({ className: "auto-backup-icon storage-cta-edit", innerHTML: PENCIL }),
+    );
+  }
+
+  /** Where backups live: local disk or a bucket of their own (PB settings.backups.s3). */
+  function openStorage() {
+    const saved = () => settings().s3 || {};
+    const cfg = store({ ...saved(), secret: "" });
+    const f = store({ busy: false, errors: {} });
+    const dirty = () =>
+      ["enabled", "endpoint", "bucket", "region", "accessKey", "forcePathStyle"].some((k) =>
+        (cfg[k] ?? "") !== (saved()[k] ?? "")
+      ) || !!cfg.secret;
+
+    async function save(close) {
+      if (!dirty()) return close();
+      f.busy = true;
+      f.errors = {};
+      // Turning S3 off sends only the switch: the bucket settings stay for the next time it is turned on.
+      const body = cfg.enabled ? { ...cfg } : { enabled: false };
+      if (!body.secret) delete body.secret;
+      try {
+        app.store.settings = await app.pb.settings.update({ backups: { s3: body } });
+        toast(cfg.enabled ? `Backups now go to S3 · ${cfg.bucket}.` : "Backups now stay on this server.", "success");
+        close();
+        load();
+      } catch (err) {
+        const fe = err?.response?.data?.backups?.s3 || {};
+        f.errors = Object.fromEntries(Object.entries(fe).map(([k, v]) => [k, v?.message || ""]));
+        toast(errMessage(err), "error", 6000);
+      } finally {
+        f.busy = false;
+      }
+    }
+
+    modal((close) =>
+      t.form(
+        { className: "form", onsubmit: (e) => (e.preventDefault(), !f.busy && save(close)) },
+        storageEditor({
+          filesystem: "backups",
+          cfg,
+          saved,
+          error: (k) => f.errors[k] || "",
+          local: { title: "This server", path: "pb_data/backups" },
+          sampleKey: "@auto_pb_backup_my_app_20260101020000.zip",
+          copyFrom: { label: "Copy from files storage", cfg: () => app.store.settings?.s3 },
+        }),
+        t.p({
+          className: "muted",
+          textContent: "Existing backups are not moved: the list shows the backups of the selected storage.",
+        }),
+        t.div(
+          { className: "row" },
+          t.span({ className: "spacer" }),
+          t.button({ type: "button", className: "btn btn-ghost", textContent: "Cancel", onclick: close }),
+          t.button({
+            type: "submit",
+            className: "btn btn-primary",
+            disabled: () => f.busy || !dirty(),
+            textContent: () => f.busy ? "Saving..." : "Save",
+          }),
+        ),
+      ), { title: "Backup storage", size: "md" });
+  }
+
   return page(
     "Backups",
     [
       autoBackupCta(),
+      storageCta(),
       fileInput,
       t.button({ className: "btn btn-sm btn-ghost", textContent: "Refresh", onclick: load }),
       t.button({

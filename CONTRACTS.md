@@ -83,6 +83,9 @@ Frozen signatures; stubs throw `notImplemented`. Change a signature only with th
 - `store.storage` is a `CurrentStorage`: `settings.s3` (enabled) points it at S3, else at the local storage the app was
   built with. No read fallback between them: a file on the old storage is 404 until migrated.
   `POST /api/settings/test/s3` (`filesystem: storage|backups`) writes and deletes a probe like PB.
+  `POST /api/_denobase/s3/check` (superuser, not PB) checks an unsaved `{filesystem, s3}` draft in steps (connect, auth,
+  bucket, write, read, cleanup) and may `suggest` a region or path style; an empty secret reuses the saved one of that
+  filesystem only when the access key is the saved one.
 - Files migration (`src/files/migrate.ts`): a `PATCH /api/settings` that changes the storage `settings.s3` names records
   the previous one as a `proposed` job (its credentials AES-GCM sealed with `DENOBASE_ENCRYPTION_KEY`, else a key in the
   data db's `_params`). A run copies record-file keys (`<collection>/<record>/...`) in sorted order with a cursor,

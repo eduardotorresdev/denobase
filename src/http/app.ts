@@ -21,6 +21,7 @@ import type { Backups } from "../backups/mod.ts";
 import { backupRoutes } from "./backups.ts";
 import type { FilesMigrations } from "../files/migrate.ts";
 import { filesMigrationRoutes } from "./files_migration.ts";
+import { s3CheckRoutes } from "./s3_check.ts";
 import { withSpoolScope } from "../files/spool.ts";
 import { collectionRoutes } from "./collections.ts";
 import type { UiSource } from "./ui_source.ts";
@@ -125,6 +126,7 @@ export function createHttp(ctx: Ctx): Hono<AppEnv> {
   cronRoutes(app, ctx);
   backupRoutes(app, ctx);
   filesMigrationRoutes(app, ctx);
+  s3CheckRoutes(app, ctx);
   collectionRoutes(app, ctx);
   statsRoutes(app, ctx);
   // /oauth/* lives outside /api: its endpoints authenticate clients and browsers themselves, never by Bearer.

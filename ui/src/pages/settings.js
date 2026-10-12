@@ -4,6 +4,7 @@ import { collectionRow } from "./collections.js";
 import { spring } from "../spring.js";
 import { isTimeZone, offsetLabel } from "../time.js";
 import { canResume, planQuestion, progressLine, progressPercent, statusBadge, whenLine } from "../migration.js";
+import { storageEditor } from "../s3connect.js";
 
 const MIGRATION = "/api/_denobase/files-migration";
 const MIGRATION_TOPIC = "_denobase/files-migration";
@@ -511,7 +512,7 @@ export function render(route) {
     return c?.enabled ? `${c.bucket}@${c.endpoint || c.region}` : "local";
   }
 
-  const mig = store({ state: null, testing: false });
+  const mig = store({ state: null });
 
   async function loadMigration() {
     try {
@@ -532,19 +533,6 @@ export function render(route) {
     } catch (err) {
       toastError(err);
       return false;
-    }
-  }
-
-  async function testS3() {
-    if (mig.testing) return;
-    mig.testing = true;
-    try {
-      await app.pb.settings.testS3("storage");
-      toast("S3 connection succeeded.", "success");
-    } catch (err) {
-      toast(errMessage(err), "error", 8000);
-    } finally {
-      mig.testing = false;
     }
   }
 
@@ -692,22 +680,18 @@ export function render(route) {
   function s3Tab() {
     return t.div(
       { className: "stack" },
-      formTab("s3"),
-      t.div(
-        { className: "row" },
-        t.span({
-          className: "muted",
-          textContent: () => dirty() ? "Save first: the test uses the saved settings." : "",
-        }),
-        t.span({ className: "spacer" }),
-        t.button({
-          type: "button",
-          className: "btn btn-sm",
-          disabled: () => mig.testing || dirty() || !data.original?.s3?.enabled,
-          textContent: () => mig.testing ? "Testing..." : "Test connection",
-          onclick: testS3,
-        }),
-      ),
+      t.div({ className: "card" }, () => {
+        // Reset swaps data.form for a fresh clone: the editor follows the new object.
+        const cfg = data.form.s3;
+        return storageEditor({
+          filesystem: "storage",
+          cfg,
+          saved: () => data.original?.s3,
+          error: (k) => data.errors[`s3.${k}`] || "",
+          local: { title: "This server", path: "pb_data/storage" },
+          sampleKey: "<collectionId>/<recordId>/photo_a1b2c3.png",
+        });
+      }),
       migrationPanel(),
     );
   }
