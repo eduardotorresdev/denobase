@@ -8,6 +8,7 @@ import { signToken, verifyToken } from "../auth/jwt.ts";
 import { allFields } from "../engine/fields.ts";
 import { recordDir } from "../engine/files.ts";
 import { serveContent } from "./serve_content.ts";
+import { DEFAULT_THUMB_SIZES, THUMB_CONTENT_TYPES, thumbName, Thumbs, thumbsDir } from "../files/thumbs.ts";
 
 /** PB file routes: POST /api/files/token and GET /api/files/{collection}/{recordId}/{filename}. */
 
@@ -69,6 +70,8 @@ function contentType(name: string, uploaded: string): string {
 const truthy = (v: string | undefined) => ["1", "t", "true"].includes((v ?? "").toLowerCase());
 
 export function fileRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
+  // PB's PB_THUMBS_MAX_WORKERS defaults to NumCPU+2; two keeps a small server's memory bounded while decoding.
+  const thumbs = new Thumbs(2);
   app.post("/api/files/token", async (c) => {
     const user = c.get("user");
     if (!user) throw unauthorized();
@@ -105,14 +108,34 @@ export function fileRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
         throw notFound();
       }
     }
-    const key = recordDir(col, id) + filename;
-    const info = await ctx.store.storage.stat(key);
+    const dir = recordDir(col, id);
+    const originalKey = dir + filename;
+    const storage = ctx.store.storage;
+    let servedKey = originalKey;
+    let servedName = filename;
+    let info = await storage.stat(originalKey);
     if (!info) throw notFound();
-    // Thumbs are not generated yet; PB itself serves the original when a thumb cannot be made.
-    const type = contentType(filename, info.type);
+    // PB: only a default or field-listed size, and only for an image original; otherwise the original is served.
+    const size = c.req.query("thumb") ?? "";
+    if (size && (DEFAULT_THUMB_SIZES.includes(size) || (field.thumbs ?? []).includes(size))) {
+      if (THUMB_CONTENT_TYPES.includes(info.type.split(";")[0].trim())) {
+        const thumbKey = dir + thumbsDir(filename) + thumbName(size, filename);
+        let thumb = await storage.stat(thumbKey);
+        if (!thumb) {
+          try {
+            await thumbs.create(storage, originalKey, thumbKey, size);
+            thumb = await storage.stat(thumbKey);
+          } catch (e) {
+            console.warn(`Fallback to original - failed to create thumb ${thumbName(size, filename)}`, e);
+          }
+        }
+        if (thumb) [servedKey, servedName, info] = [thumbKey, thumbName(size, filename), thumb];
+      }
+    }
+    const type = contentType(servedName, info.type);
     const disposition = !truthy(c.req.query("download")) && INLINE.has(type.split(";")[0]) ? "inline" : "attachment";
     const headers = new Headers({
-      "Content-Disposition": `${disposition}; filename=${JSON.stringify(filename)}`,
+      "Content-Disposition": `${disposition}; filename=${JSON.stringify(servedName)}`,
       "Content-Type": type,
       "Content-Security-Policy": "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; sandbox",
       "Cache-Control": "max-age=2592000, stale-while-revalidate=86400",
@@ -121,7 +144,7 @@ export function fileRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
       request: c.req.raw,
       info,
       headers,
-      open: async (range) => (await ctx.store.storage.get(key, { range }))?.body ?? null,
+      open: async (range) => (await storage.get(servedKey, { range }))?.body ?? null,
     });
   });
 }

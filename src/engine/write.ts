@@ -1,3 +1,4 @@
+import { thumbsDir } from "../files/thumbs.ts";
 import { type ChangedItem, type CollectionConfig, type Doc, LOCKED, type Req } from "../core/types.ts";
 import { badRequest, notFound } from "../core/errors.ts";
 import { afterCommit, tx } from "../core/db.ts";
@@ -269,7 +270,12 @@ async function storeFiles(req: Req, c: CollectionConfig, id: string, files: File
   }
   if (files.removed.length) {
     afterCommit(req.db, () => {
-      for (const n of files.removed) void storage.delete(dir + n).catch((e) => logFileDeleteError(dir + n, e));
+      for (const n of files.removed) {
+        void storage.delete(dir + n).catch((e) => logFileDeleteError(dir + n, e));
+        // PB's FileField deletes the file's thumbs with it.
+        const thumbs = dir + thumbsDir(n);
+        void storage.deletePrefix(thumbs).catch((e) => console.warn("Failed to delete file thumbs", thumbs, e));
+      }
     });
   }
 }

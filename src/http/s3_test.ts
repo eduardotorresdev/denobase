@@ -125,6 +125,9 @@ Deno.test("a storage that fails to delete after commit is logged, never an unhan
   const logged: unknown[] = [];
   const err = console.error;
   console.error = (...a: unknown[]) => void logged.push(a[0]);
+  const warn = console.warn;
+  const warned: unknown[] = [];
+  console.warn = (...a: unknown[]) => void warned.push(a[0]);
   try {
     const down = () => Promise.reject(new Error("S3 503 Slow Down"));
     t.local.delete = down;
@@ -136,8 +139,11 @@ Deno.test("a storage that fails to delete after commit is logged, never an unhan
     assertEquals((await t.call("DELETE", `/api/collections/s3_docs/records/${a.id}`)).status, 204);
     for (let i = 0; i < 50 && logged.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
     assertEquals(logged, ["Failed to delete files", "Failed to delete files"]);
+    // The dropped file's thumbs are a warning apart, like PB's.
+    assertEquals(warned, ["Failed to delete file thumbs"]);
   } finally {
     console.error = err;
+    console.warn = warn;
     await t.app.terminate();
   }
 });
