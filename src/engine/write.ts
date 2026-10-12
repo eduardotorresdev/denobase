@@ -1,4 +1,4 @@
-import { thumbsDir } from "../files/thumbs.ts";
+import { thumbsDir, thumbsFor } from "../files/thumbs.ts";
 import { type ChangedItem, type CollectionConfig, type Doc, LOCKED, type Req } from "../core/types.ts";
 import { badRequest, notFound } from "../core/errors.ts";
 import { afterCommit, afterRollback, tx } from "../core/db.ts";
@@ -245,7 +245,15 @@ async function removeRecord(a: Omit<WriteArgs, "data"> & { id: string }): Promis
     // PB deletes a record's files only once the delete is committed.
     if (fileNames(c, doc).length) {
       const dir = recordDir(c, a.id);
-      afterCommit(req.db, () => void req.store.storage.deletePrefix(dir).catch((e) => logFileDeleteError(dir, e)));
+      const { storage } = req.store;
+      // In-flight thumb generations of this record are canceled and awaited first, so none lands after the sweep.
+      afterCommit(
+        req.db,
+        () =>
+          void thumbsFor(storage).cancel(dir).then(() => storage.deletePrefix(dir)).catch((e) =>
+            logFileDeleteError(dir, e)
+          ),
+      );
     }
     const after = c.hooks?.afterDelete ?? [];
     await traceHook(c, "afterDelete", after.length, async () => {
@@ -286,9 +294,12 @@ async function storeFiles(req: Req, c: CollectionConfig, id: string, files: File
     afterCommit(req.db, () => {
       for (const n of files.removed) {
         void storage.delete(dir + n).catch((e) => logFileDeleteError(dir + n, e));
-        // PB's FileField deletes the file's thumbs with it.
+        // PB's FileField deletes the file's thumbs with it; generations still running for the file are canceled and
+        // awaited first, or one finishing after the sweep would leave an orphaned thumb.
         const thumbs = dir + thumbsDir(n);
-        void storage.deletePrefix(thumbs).catch((e) => console.warn("Failed to delete file thumbs", thumbs, e));
+        void thumbsFor(storage).cancel(thumbs).then(() => storage.deletePrefix(thumbs)).catch((e) =>
+          console.warn("Failed to delete file thumbs", thumbs, e)
+        );
       }
     });
   }

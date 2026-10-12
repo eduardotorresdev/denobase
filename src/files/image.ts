@@ -1,7 +1,7 @@
 import { convertIndexedToRgb, decode as decodePng, encode as encodePng } from "fast-png";
 import jpeg from "jpeg-js";
 import { GifReader, GifWriter } from "omggif";
-import { Unzlib } from "fflate";
+import { Unzlib, zlibSync } from "fflate";
 
 /**
  * The image half of PB's filesystem.CreateThumb (disintegration/imaging): decode by magic bytes (first frame of a
@@ -145,11 +145,16 @@ export function sanitizePng(b: Uint8Array): { png: Uint8Array; key: number[] | n
       if (pw > 0 && ph > 0) expected += ph * rowBytes(pw);
     }
   } else expected = height * rowBytes(width);
+  // fast-png de-interlaces as if every sample were a byte, so a sub-byte Adam7 image is rewritten here as a plain one.
+  const adam7Packed = interlace === 1 && depth < 8;
+  const raw: Uint8Array[] = [];
   let inflated = 0;
   const z = new Unzlib((chunk) => {
     inflated += chunk.length;
     if (inflated > expected) throw new Error("png: image data larger than its header declares");
+    if (adam7Packed) raw.push(chunk);
   });
+  let idatAt = -1;
   const parts: Uint8Array[] = [b.subarray(0, 8)];
   let key: number[] | null = null;
   let at = 8;
@@ -161,15 +166,116 @@ export function sanitizePng(b: Uint8Array): { png: Uint8Array; key: number[] | n
     // A gray or truecolor tRNS is a color key read here: fast-png validates it as if it were per-pixel alpha.
     if (type === "tRNS" && (channels === 1 || channels === 3)) {
       if (len >= channels * 2) key = Array.from({ length: channels }, (_, k) => u16be(b, at + 8 + k * 2));
+    } else if (type === "IDAT") {
+      if (!adam7Packed) parts.push(b.subarray(at, end));
+      else if (idatAt < 0) idatAt = parts.length;
+      z.push(b.subarray(at + 8, at + 8 + len));
     } else if (PNG_KEEP.has(type)) parts.push(b.subarray(at, end));
-    if (type === "IDAT") z.push(b.subarray(at + 8, at + 8 + len));
     at = end;
     if (type === "IEND") break;
   }
+  if (adam7Packed) {
+    z.push(new Uint8Array(0), true);
+    if (idatAt < 0) throw new Error("png: no image data");
+    const plain = deinterlacePacked(concat(raw), width, height, channels * depth);
+    if (ascii(b, 12, 4) !== "IHDR") throw new Error("png: IHDR must come first");
+    const ihdr = b.slice(8, 33);
+    ihdr[20] = 0; // the interlace method: 8 bytes of length and type, then its 13th data byte
+    parts[1] = withCrc(ihdr);
+    parts.splice(idatAt, 0, chunk("IDAT", zlibSync(plain)));
+  }
+  return { png: concat(parts), key };
+}
+
+function concat(parts: Uint8Array[]): Uint8Array {
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
   let o = 0;
   for (const p of parts) out.set(p, (o += p.length) - p.length);
-  return { png: out, key };
+  return out;
+}
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+/** Rewrites the CRC of a whole chunk (length, type, data, crc) after its data changed. */
+function withCrc(c: Uint8Array): Uint8Array {
+  let crc = 0xffffffff;
+  for (let i = 4; i < c.length - 4; i++) crc = CRC_TABLE[(crc ^ c[i]) & 0xff] ^ (crc >>> 8);
+  new DataView(c.buffer, c.byteOffset).setUint32(c.length - 4, (crc ^ 0xffffffff) >>> 0);
+  return c;
+}
+
+function chunk(type: string, data: Uint8Array): Uint8Array {
+  const c = new Uint8Array(12 + data.length);
+  new DataView(c.buffer).setUint32(0, data.length);
+  for (let i = 0; i < 4; i++) c[4 + i] = type.charCodeAt(i);
+  c.set(data, 8);
+  return withCrc(c);
+}
+
+/** PNG's per-row unfilter; bpp is 1 for every sub-byte format. */
+function unfilter(row: Uint8Array, prev: Uint8Array | null, filter: number, bpp: number): void {
+  for (let i = 0; i < row.length; i++) {
+    const a = i >= bpp ? row[i - bpp] : 0, up = prev ? prev[i] : 0, c = prev && i >= bpp ? prev[i - bpp] : 0;
+    switch (filter) {
+      case 0:
+        break;
+      case 1:
+        row[i] = (row[i] + a) & 0xff;
+        break;
+      case 2:
+        row[i] = (row[i] + up) & 0xff;
+        break;
+      case 3:
+        row[i] = (row[i] + ((a + up) >> 1)) & 0xff;
+        break;
+      case 4: {
+        const p = a + up - c, pa = Math.abs(p - a), pb = Math.abs(p - up), pc = Math.abs(p - c);
+        row[i] = (row[i] + (pa <= pb && pa <= pc ? a : pb <= pc ? up : c)) & 0xff;
+        break;
+      }
+      default:
+        throw new Error("png: invalid filter type");
+    }
+  }
+}
+
+/**
+ * Adam7 (sub-byte pixels) to the non-interlaced stream fast-png reads: each pass unfiltered, its pixels scattered to
+ * their place in packed rows, every row then sent with filter 0.
+ */
+export function deinterlacePacked(data: Uint8Array, width: number, height: number, bits: number): Uint8Array {
+  const stride = Math.ceil((width * bits) / 8);
+  const out = new Uint8Array(height * (stride + 1));
+  const mask = (1 << bits) - 1;
+  let at = 0;
+  for (const [x0, y0, dx, dy] of ADAM7) {
+    const pw = Math.ceil((width - x0) / dx), ph = Math.ceil((height - y0) / dy);
+    if (pw <= 0 || ph <= 0) continue;
+    const rb = Math.ceil((pw * bits) / 8);
+    let prev: Uint8Array | null = null;
+    for (let j = 0; j < ph; j++) {
+      if (at + 1 + rb > data.length) throw new Error("png: truncated image data");
+      const row = data.subarray(at + 1, at + 1 + rb);
+      unfilter(row, prev, data[at], 1);
+      prev = row;
+      at += 1 + rb;
+      const y = y0 + j * dy;
+      for (let i = 0; i < pw; i++) {
+        const v = (row[(i * bits) >> 3] >> (8 - bits - ((i * bits) & 7))) & mask;
+        const xb = (x0 + i * dx) * bits;
+        out[y * (stride + 1) + 1 + (xb >> 3)] |= v << (8 - bits - (xb & 7));
+      }
+    }
+  }
+  return out;
 }
 
 function fromPng(b: Uint8Array): Rgba {
@@ -191,10 +297,6 @@ function fromPng(b: Uint8Array): Rgba {
     return { width, height, data };
   }
   const channels = png.channels;
-  if (depth < 8 && b[28] === 1) {
-    // fast-png treats an interlaced sub-byte image as one byte per sample and loses the pixels; the original is served.
-    throw new Error("png: interlaced images below 8 bits per sample are not supported");
-  }
   // Raw samples at the stored depth: fast-png leaves rows of sub-byte samples packed, padded to a byte per row.
   const raw = png.data;
   const rowBits = width * channels * depth;

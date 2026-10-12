@@ -1,5 +1,6 @@
 import type { BlobStore } from "./storage.ts";
 import { readAll } from "./storage.ts";
+import { type ThumbPool, thumbPool } from "./thumb_pool.ts";
 import { decodeImage, encodeImage, fill, fit, MAX_THUMB_SIDE, resize } from "./image.ts";
 
 /**
@@ -50,16 +51,22 @@ export async function renderThumb(
 /** PB's thumbGenMaxWait default: how long a request waits for a generation slot before falling back. */
 const MAX_WAIT_MS = 60_000;
 
+interface Generation {
+  done: Promise<void>;
+  abort: AbortController;
+}
+
 /**
- * The generator: one in-flight generation per thumb key (PB's singleflight) and at most `workers` decoding at once
- * (PB's semaphore), since a decode holds the whole bitmap in memory.
+ * The generator: one in-flight generation per thumb key (PB's singleflight) and at most `workers` rendering at once
+ * (PB's semaphore), since a decode holds the whole bitmap in memory. Rendering runs on the worker pool. Generations are
+ * registered by key so a file's replace or delete can cancel them and wait them out before removing its thumbs dir.
  */
 export class Thumbs {
-  #pending = new Map<string, Promise<void>>();
+  #pending = new Map<string, Generation>();
   #running = 0;
   #queue: (() => void)[] = [];
 
-  constructor(readonly workers = 2, readonly maxWaitMs = MAX_WAIT_MS) {}
+  constructor(readonly workers = 2, readonly maxWaitMs = MAX_WAIT_MS, readonly pool: ThumbPool = thumbPool()) {}
 
   /** Generations started and not yet settled, for tests. */
   get inFlight(): number {
@@ -69,23 +76,49 @@ export class Thumbs {
   /** Creates the thumb at thumbKey from originalKey; concurrent calls for one thumbKey share one generation. */
   create(storage: BlobStore, originalKey: string, thumbKey: string, size: string): Promise<void> {
     const running = this.#pending.get(thumbKey);
-    if (running) return running;
-    const p = this.#generate(storage, originalKey, thumbKey, size).finally(() => this.#pending.delete(thumbKey));
-    this.#pending.set(thumbKey, p);
-    return p;
+    if (running) return running.done;
+    const abort = new AbortController();
+    const g: Generation = { abort, done: Promise.resolve() };
+    g.done = this.#generate(storage, originalKey, thumbKey, size, abort.signal).finally(() => {
+      if (this.#pending.get(thumbKey) === g) this.#pending.delete(thumbKey);
+    });
+    this.#pending.set(thumbKey, g);
+    return g.done;
   }
 
-  async #generate(storage: BlobStore, originalKey: string, thumbKey: string, size: string): Promise<void> {
-    await this.#acquire();
+  /** Waits until no generation under `prefix` (a thumbs dir) is in flight; their outcome is not reported. */
+  async settled(prefix: string): Promise<void> {
+    const mine = [...this.#pending].filter(([k]) => k.startsWith(prefix)).map(([, g]) => g.done.catch(() => {}));
+    await Promise.all(mine);
+  }
+
+  /**
+   * Cancels every generation under `prefix` and waits them out: none writes after this resolves, and a put already
+   * under way has landed, so a deletePrefix that follows leaves nothing behind.
+   */
+  cancel(prefix: string): Promise<void> {
+    for (const [k, g] of this.#pending) if (k.startsWith(prefix)) g.abort.abort(new Error("thumb generation canceled"));
+    return this.settled(prefix);
+  }
+
+  async #generate(
+    storage: BlobStore,
+    originalKey: string,
+    thumbKey: string,
+    size: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    await this.#acquire(signal);
     try {
       const obj = await storage.get(originalKey);
       if (!obj) throw new Error("original file not found");
       const bytes = await readAll(obj.body);
-      const thumb = await renderThumb(bytes, obj.type.split(";")[0].trim(), size);
+      signal.throwIfAborted();
+      const thumb = await this.pool.render(bytes, obj.type.split(";")[0].trim(), size, signal);
+      signal.throwIfAborted();
       await storage.put(thumbKey, thumb.bytes, { type: thumb.type });
-      // The file or its record may have been deleted while this rendered: its thumbs_ cleanup has then already run
-      // and this put would be left orphaned, so the generation cleans up after itself.
-      if (!(await storage.stat(originalKey))) {
+      // Canceled during the put, or the original went without a cancel (another process): undo it.
+      if (signal.aborted || !(await storage.stat(originalKey))) {
         await storage.delete(thumbKey);
         throw new Error("original file not found");
       }
@@ -94,7 +127,7 @@ export class Thumbs {
     }
   }
 
-  #acquire(): Promise<void> {
+  #acquire(signal: AbortSignal): Promise<void> {
     if (this.#running < this.workers) {
       this.#running++;
       return Promise.resolve();
@@ -102,13 +135,19 @@ export class Thumbs {
     return new Promise((resolve, reject) => {
       const take = () => {
         clearTimeout(timer);
+        signal.removeEventListener("abort", onAbort);
         this.#running++;
         resolve();
       };
-      const timer = setTimeout(() => {
+      const drop = (e: Error) => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", onAbort);
         this.#queue = this.#queue.filter((f) => f !== take);
-        reject(new Error("timed out waiting for a thumb generation slot"));
-      }, this.maxWaitMs);
+        reject(e);
+      };
+      const onAbort = () => drop(new Error("thumb generation canceled"));
+      const timer = setTimeout(() => drop(new Error("timed out waiting for a thumb generation slot")), this.maxWaitMs);
+      signal.addEventListener("abort", onAbort, { once: true });
       this.#queue.push(take);
     });
   }
@@ -117,4 +156,15 @@ export class Thumbs {
     this.#running--;
     this.#queue.shift()?.();
   }
+}
+
+const registry = new WeakMap<BlobStore, Thumbs>();
+/**
+ * The generator of one storage: the files route creates through it and a record write cancels through it, so both
+ * see the same in-flight registry.
+ */
+export function thumbsFor(storage: BlobStore): Thumbs {
+  let t = registry.get(storage);
+  if (!t) registry.set(storage, t = new Thumbs(2));
+  return t;
 }

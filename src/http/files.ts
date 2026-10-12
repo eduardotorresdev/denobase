@@ -8,7 +8,7 @@ import { signToken, verifyToken } from "../auth/jwt.ts";
 import { allFields } from "../engine/fields.ts";
 import { recordDir } from "../engine/files.ts";
 import { serveContent } from "./serve_content.ts";
-import { DEFAULT_THUMB_SIZES, THUMB_CONTENT_TYPES, thumbName, Thumbs, thumbsDir } from "../files/thumbs.ts";
+import { DEFAULT_THUMB_SIZES, THUMB_CONTENT_TYPES, thumbName, thumbsDir, thumbsFor } from "../files/thumbs.ts";
 
 /** PB file routes: POST /api/files/token and GET /api/files/{collection}/{recordId}/{filename}. */
 
@@ -70,8 +70,6 @@ function contentType(name: string, uploaded: string): string {
 const truthy = (v: string | undefined) => ["1", "t", "true"].includes((v ?? "").toLowerCase());
 
 export function fileRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
-  // PB's PB_THUMBS_MAX_WORKERS defaults to NumCPU+2; two keeps a small server's memory bounded while decoding.
-  const thumbs = new Thumbs(2);
   app.post("/api/files/token", async (c) => {
     const user = c.get("user");
     if (!user) throw unauthorized();
@@ -123,7 +121,7 @@ export function fileRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
         let thumb = await storage.stat(thumbKey);
         if (!thumb) {
           try {
-            await thumbs.create(storage, originalKey, thumbKey, size);
+            await thumbsFor(storage).create(storage, originalKey, thumbKey, size);
             thumb = await storage.stat(thumbKey);
           } catch (e) {
             console.warn(`Fallback to original - failed to create thumb ${thumbName(size, filename)}`, e);

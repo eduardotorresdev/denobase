@@ -1,11 +1,12 @@
 import { assert, assertEquals, assertRejects } from "@std/assert";
 import { decode as decodePng, encode as encodePng } from "fast-png";
-import { zlibSync } from "fflate";
+import { unzlibSync, zlibSync } from "fflate";
 import { pngOf, twoTone } from "./testkit.ts";
 import jpeg from "jpeg-js";
 import encodeWebp from "@jsquash/webp/encode.js";
 import { decodeImage, encodeImage, exifOrientation, imageSize, orient, type Rgba, sniffFormat } from "./image.ts";
 import { renderThumb, Thumbs } from "./thumbs.ts";
+import { ThumbPool } from "./thumb_pool.ts";
 import { MemoryStorage, readAll } from "./storage.ts";
 
 const px = (
@@ -205,12 +206,13 @@ function rawPng(
   colorType: number,
   idat: Uint8Array,
   extra: Uint8Array[] = [],
+  interlace = 0,
 ): Uint8Array {
   const ihdr = new Uint8Array(13);
   const dv = new DataView(ihdr.buffer);
   dv.setUint32(0, w);
   dv.setUint32(4, h);
-  ihdr.set([depth, colorType, 0, 0, 0], 8);
+  ihdr.set([depth, colorType, 0, 0, interlace], 8);
   const parts = [
     new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
     chunk("IHDR", ihdr),
@@ -310,4 +312,171 @@ Deno.test("a thumb generated while its original is deleted does not outlive it",
   const thumbs = new Thumbs(1);
   await assertRejects(() => thumbs.create(racing, "c/r/a.png", "c/r/thumbs_a.png/10x10_a.png", "10x10"));
   assertEquals(await storage.stat("c/r/thumbs_a.png/10x10_a.png"), null);
+});
+
+// --- Adam7 below 8 bits ---
+
+const ADAM7 = [[0, 0, 8, 8], [4, 0, 8, 8], [0, 4, 4, 8], [2, 0, 4, 4], [0, 2, 2, 4], [1, 0, 2, 2], [0, 1, 1, 2]];
+
+/** Encodes one sample grid both plainly and as Adam7, each row with a filter cycling through all five. */
+function packedPngs(w: number, h: number, depth: number, sample: (x: number, y: number) => number) {
+  const pack = (vals: number[]) => {
+    const row = new Array(Math.ceil((vals.length * depth) / 8)).fill(0);
+    vals.forEach((v, i) => row[(i * depth) >> 3] |= v << (8 - depth - ((i * depth) & 7)));
+    return row;
+  };
+  const filtered = (rows: number[][]) => {
+    const out: number[] = [];
+    rows.forEach((row, j) => {
+      const f = j % 5, prev = j ? rows[j - 1] : row.map(() => 0);
+      out.push(f);
+      row.forEach((v, i) => {
+        const a = i ? row[i - 1] : 0, b = prev[i], c = i ? prev[i - 1] : 0;
+        const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+        const pred = [0, a, b, (a + b) >> 1, pa <= pb && pa <= pc ? a : pb <= pc ? b : c][f];
+        out.push((v - pred) & 0xff);
+      });
+    });
+    return out;
+  };
+  const plain: number[][] = [];
+  for (let y = 0; y < h; y++) plain.push(pack(Array.from({ length: w }, (_, x) => sample(x, y))));
+  const passes: number[] = [];
+  for (const [x0, y0, dx, dy] of ADAM7) {
+    const rows: number[][] = [];
+    for (let y = y0; y < h; y += dy) {
+      const vals: number[] = [];
+      for (let x = x0; x < w; x += dx) vals.push(sample(x, y));
+      if (vals.length) rows.push(pack(vals));
+    }
+    passes.push(...filtered(rows));
+  }
+  return { plain: zlibSync(new Uint8Array(filtered(plain))), adam7: zlibSync(new Uint8Array(passes)) };
+}
+
+Deno.test("Adam7 PNGs below 8 bits are de-interlaced: gray 1/2/4 and palette 1/2/4 match the plain encoding", async () => {
+  for (const depth of [1, 2, 4]) {
+    const max = (1 << depth) - 1;
+    const sample = (x: number, y: number) => (x * 7 + y * 3 + ((x * y) >> 1)) & max;
+    for (const [w, h] of [[13, 11], [1, 1], [3, 9], [17, 2]]) {
+      const { plain, adam7 } = packedPngs(w, h, depth, sample);
+      const gray = await decodeImage(rawPng(w, h, depth, 0, adam7, [], 1));
+      assertEquals(gray, await decodeImage(rawPng(w, h, depth, 0, plain)), `gray ${depth}-bit ${w}x${h}`);
+      const levels = 1 << depth;
+      const plte = chunk("PLTE", new Uint8Array(Array.from({ length: levels * 3 }, (_, i) => (i * 37) & 0xff)));
+      const trns = chunk("tRNS", new Uint8Array([0, 128]));
+      const pal = await decodeImage(rawPng(w, h, depth, 3, adam7, [plte, trns], 1));
+      assertEquals(
+        pal,
+        await decodeImage(rawPng(w, h, depth, 3, plain, [plte, trns])),
+        `palette ${depth}-bit ${w}x${h}`,
+      );
+    }
+  }
+  // And it gets a thumb.
+  const { adam7 } = packedPngs(40, 40, 1, (x) => (x < 20 ? 1 : 0));
+  const t = await thumbOf(rawPng(40, 40, 1, 0, adam7, [], 1), "image/png", "10x10");
+  assertEquals(px(t.img, 0, 5), [255, 255, 255, 255]);
+  assertEquals(px(t.img, 9, 5), [0, 0, 0, 255]);
+});
+
+Deno.test("an Adam7 sub-byte PNG whose passes run short is refused", async () => {
+  const { adam7 } = packedPngs(13, 11, 1, () => 1);
+  const short = zlibSync(unzlibSync(adam7).subarray(0, 10));
+  await assertRejects(() => decodeImage(rawPng(13, 11, 1, 0, short, [], 1)), Error, "truncated");
+});
+
+// --- worker pool ---
+
+Deno.test("ThumbPool renders off thread, transfers the input, and replaces a worker that times out", async () => {
+  const pool = new ThumbPool(1, 30_000);
+  try {
+    const src = pngOf(twoTone(40, 20, "lr"));
+    const out = await pool.render(src, "image/png", "10x10");
+    assertEquals(src.byteLength, 0, "the original's buffer is transferred, not copied");
+    assertEquals(out.type, "image/png");
+    assertEquals((await decodeImage(out.bytes)).width, 10);
+    assertEquals(pool.spawned, 1);
+    // Reused while warm.
+    await pool.render(pngOf(twoTone(40, 20, "lr")), "image/png", "10x10");
+    assertEquals(pool.spawned, 1);
+
+    pool.timeoutMs = 1;
+    const big = pngOf(twoTone(3000, 3000, "lr"));
+    await assertRejects(() => pool.render(big, "image/png", "100x100"), Error, "passed 1ms");
+    pool.timeoutMs = 30_000;
+    const again = await pool.render(pngOf(twoTone(40, 20, "lr")), "image/png", "10x10");
+    assertEquals((await decodeImage(again.bytes)).width, 10);
+    assertEquals(pool.spawned, 2, "the timed-out worker was terminated and a fresh one took its seat");
+
+    // Guards still apply inside the worker; the error comes back by message.
+    await assertRejects(() => pool.render(new Uint8Array([1, 2, 3]), "image/png", "10x10"), Error, "unsupported");
+    // A view into a larger buffer is copied before the transfer, so the rest of the buffer stays with the caller.
+    const inner = pngOf(twoTone(40, 20, "lr"));
+    const whole = new Uint8Array(inner.length + 64);
+    whole.set(inner, 32);
+    await pool.render(whole.subarray(32, 32 + inner.length), "image/png", "10x10");
+    assertEquals(whole.byteLength, inner.length + 64);
+  } finally {
+    pool.close();
+  }
+});
+
+Deno.test("Thumbs.cancel stops in-flight generations for a file and awaits them before its thumbs are swept", async () => {
+  const storage = new MemoryStorage();
+  await storage.put("c/r/a.png", pngOf(twoTone(20, 20, "lr")), { type: "image/png" });
+  await storage.put("c/r/b.png", pngOf(twoTone(20, 20, "lr")), { type: "image/png" });
+  let putStarted!: () => void;
+  const started = new Promise<void>((r) => putStarted = r);
+  let finishPut!: () => void;
+  const slow: typeof storage = Object.create(storage);
+  slow.stat = (key) => storage.stat(key);
+  slow.get = (key, opts) => storage.get(key, opts);
+  slow.delete = (key) => storage.delete(key);
+  slow.put = async (key, body, meta) => {
+    if (key.startsWith("c/r/thumbs_a.png/")) {
+      putStarted();
+      await new Promise<void>((r) => finishPut = r);
+    }
+    return await storage.put(key, body, meta);
+  };
+  const thumbs = new Thumbs(2);
+  const a = thumbs.create(slow, "c/r/a.png", "c/r/thumbs_a.png/10x10_a.png", "10x10");
+  const b = thumbs.create(slow, "c/r/b.png", "c/r/thumbs_b.png/10x10_b.png", "10x10");
+  await started;
+  // The put is under way when the file is replaced: cancel must not resolve before it lands and is undone.
+  let canceled = false;
+  const cancel = thumbs.cancel("c/r/thumbs_a.png/").then(() => canceled = true);
+  await new Promise((r) => setTimeout(r, 10));
+  assertEquals(canceled, false);
+  finishPut();
+  await cancel;
+  await storage.deletePrefix("c/r/thumbs_a.png/");
+  await assertRejects(() => a);
+  assertEquals(await storage.stat("c/r/thumbs_a.png/10x10_a.png"), null);
+  // Other files are untouched.
+  await b;
+  assert(await storage.stat("c/r/thumbs_b.png/10x10_b.png"));
+  assertEquals(thumbs.inFlight, 0);
+
+  // Canceled before it reaches the pool: nothing is rendered or written.
+  let gets = 0;
+  const counting: typeof storage = Object.create(storage);
+  counting.stat = (key) => storage.stat(key);
+  counting.put = (key, body, meta) => storage.put(key, body, meta);
+  counting.delete = (key) => storage.delete(key);
+  counting.get = async (key, opts) => {
+    gets++;
+    await new Promise((r) => setTimeout(r, 10));
+    return await storage.get(key, opts);
+  };
+  const c = thumbs.create(counting, "c/r/b.png", "c/r/thumbs_b.png/20x20_b.png", "20x20");
+  await thumbs.cancel("c/r/");
+  await assertRejects(() => c, Error, "canceled");
+  assertEquals([gets, await storage.stat("c/r/thumbs_b.png/20x20_b.png")], [1, null]);
+  // settled() waits without canceling.
+  const d = thumbs.create(counting, "c/r/b.png", "c/r/thumbs_b.png/30x30_b.png", "30x30");
+  await thumbs.settled("c/r/thumbs_b.png/");
+  await d;
+  assert(await storage.stat("c/r/thumbs_b.png/30x30_b.png"));
 });
