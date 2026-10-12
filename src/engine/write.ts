@@ -47,7 +47,7 @@ async function createRecord(a: WriteArgs): Promise<Doc> {
     data = known(c, await runCollHooks(req, c, "beforeValidate", data, "create"));
     const id = recordId(req, c, a.data.id, a.overrideAccess);
     const errs = {};
-    const files = prepareFiles(c, data, undefined, errs);
+    const files = await prepareFiles(c, data, undefined, errs);
     validate(c, data, "create", errs);
     checkDb(req, c, data, "create", id);
     await runFieldHooks(req, c, "beforeChange", data, "create");
@@ -109,7 +109,7 @@ async function applyUpdate(c: CollectionConfig, req: Req, a: WriteArgs & { id: s
   await runFieldHooks(req, c, "beforeValidate", data, "update", original);
   data = known(c, await runCollHooks(req, c, "beforeValidate", data, "update", original));
   const errs = {};
-  const files = prepareFiles(c, data, original, errs);
+  const files = await prepareFiles(c, data, original, errs);
   validate(c, { ...original, ...data }, "update", errs);
   checkDb(req, c, data, "update", a.id);
   await runFieldHooks(req, c, "beforeChange", data, "update", original);
@@ -280,7 +280,7 @@ async function storeFiles(req: Req, c: CollectionConfig, id: string, files: File
     const key = dir + u.name;
     // Listed before the put: a put that fails midway may still have left an object behind.
     uploaded.push(key);
-    await storage.put(key, u.file.stream(), { type: u.file.type });
+    await storage.put(key, u.file.stream(), { type: u.type });
   }
   if (files.removed.length) {
     afterCommit(req.db, () => {

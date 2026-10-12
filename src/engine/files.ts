@@ -3,6 +3,7 @@ import type { ApiError } from "../core/errors.ts";
 import { collectionId } from "../core/registry.ts";
 import { isMany } from "../schema/mod.ts";
 import { normalizeName } from "../files/name.ts";
+import { detectFile, mimeIs, type MimeType } from "../files/mimetype.ts";
 import { allFields } from "./fields.ts";
 import { fileList, fromList } from "./values.ts";
 
@@ -19,6 +20,8 @@ export const recordDir = (c: CollectionConfig, id: string) => `${collectionId(c)
 export interface Upload {
   name: string;
   file: File;
+  /** Sniffed from the content (PB's mimetype.DetectReader), the stored Content-Type; the client's type is ignored. */
+  type: string;
 }
 
 export interface FileChanges {
@@ -33,12 +36,12 @@ type Errs = ApiError["data"];
  * PB FileField.ValidateValue plus the upload naming: new names must come as uploads (a client cannot point a record
  * at a file it did not upload), then count, size and type. Uploads are replaced in data by their stored names.
  */
-export function prepareFiles(
+export async function prepareFiles(
   c: CollectionConfig,
   data: Record<string, unknown>,
   original: Doc | undefined,
   errs: Errs,
-): FileChanges {
+): Promise<FileChanges> {
   const changes: FileChanges = { uploads: [], removed: [] };
   for (const f of allFields(c)) {
     if (f.type !== "file" || !(f.name in data)) continue;
@@ -63,13 +66,14 @@ export function prepareFiles(
         names.push(item);
         continue;
       }
-      const error = checkUpload(f, item);
+      const mt = await detectFile(item);
+      const error = checkUpload(f, item, mt);
       if (error) {
         errs[f.name] = error;
         break;
       }
       const name = normalizeName(item.name);
-      changes.uploads.push({ name, file: item });
+      changes.uploads.push({ name, file: item, type: mt.mime });
       names.push(name);
     }
     if (errs[f.name]) continue;
@@ -79,7 +83,7 @@ export function prepareFiles(
   return changes;
 }
 
-function checkUpload(f: FileField, file: File): { code: string; message: string } | null {
+function checkUpload(f: FileField, file: File, mt: MimeType): { code: string; message: string } | null {
   const original = file.name.slice(0, 300);
   const max = f.maxSize && f.maxSize > 0 ? f.maxSize : DEFAULT_MAX_SIZE;
   if (file.size > max) {
@@ -88,7 +92,7 @@ function checkUpload(f: FileField, file: File): { code: string; message: string 
       message: `Failed to upload ${original} - the maximum allowed file size is ${max} bytes.`,
     };
   }
-  if (f.mimeTypes?.length && !f.mimeTypes.includes(file.type.split(";")[0].trim())) {
+  if (f.mimeTypes?.length && !f.mimeTypes.some((t) => mimeIs(mt, t))) {
     return {
       code: "validation_invalid_mime_type",
       message: `${JSON.stringify(original)} mime type must be one of: ${f.mimeTypes.join(", ")}.`,

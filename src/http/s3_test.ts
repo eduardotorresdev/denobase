@@ -54,7 +54,7 @@ Deno.test("saving settings.s3 swaps the files storage: uploads, serving with Ran
     assertEquals((await t.call("PATCH", "/api/settings", { s3: s3.config })).status, 200);
     const rec = await t.upload("b.txt", "0123456789");
     const key = `${rec.collectionId}/${rec.id}/${rec.anexo}`;
-    assertEquals([t.local.files.size, s3.objects.get(key)?.type], [1, "text/plain"]);
+    assertEquals([t.local.files.size, s3.objects.get(key)?.type], [1, "text/plain; charset=utf-8"]);
 
     const res = await t.app.http.request(`/api/files/${rec.collectionId}/${rec.id}/${rec.anexo}`, {
       headers: { range: "bytes=3-5" },

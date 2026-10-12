@@ -115,14 +115,16 @@ Deno.test("a size not in the field's thumbs (nor 100x100) or a non-image serves 
       const { res, bytes } = await t.get(r, r.foto, "?thumb=100x100");
       assertEquals([res.status, new TextDecoder().decode(bytes)], [200, "<svg/>"]);
     }
-    // An "image" that does not decode falls back to the original, and no thumb is stored.
-    const broken = await t.upload("foto", new File(["not a png"], "x.png", { type: "image/png" }));
+    // An "image" that does not decode falls back to the original, and no thumb is stored. It needs a PNG signature:
+    // the stored type is sniffed, and a text body would be stored as text/plain and never get to the decoder.
+    const sig = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+    const broken = await t.upload("foto", new File([sig, "not a png"], "x.png", { type: "image/png" }));
     const warn = console.warn;
     const warned: unknown[] = [];
     console.warn = (...a: unknown[]) => warned.push(a[0]);
     const fb = await t.get(broken, broken.foto, "?thumb=100x100").finally(() => console.warn = warn);
     assertEquals(warned, [`Fallback to original - failed to create thumb 100x100_${broken.foto}`]);
-    assertEquals([fb.res.status, new TextDecoder().decode(fb.bytes)], [200, "not a png"]);
+    assertEquals([fb.res.status, fb.bytes.length], [200, sig.length + "not a png".length]);
     assertEquals(keysOf(t.storage).filter((k) => k.includes("thumbs_")), []);
     // A missing file is still 404 with ?thumb.
     assertEquals((await t.get(rec, "nope.png", "?thumb=100x100")).res.status, 404);

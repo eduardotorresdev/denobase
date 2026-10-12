@@ -30,7 +30,9 @@ const fl_docs = defineCollection({
 });
 registerCollections(fl_membros, fl_docs);
 
-const png = (name = "Foto Capa.PNG") => new File([new Uint8Array([137, 80, 78, 71])], name, { type: "image/png" });
+/** A PNG signature: the stored type is sniffed from the bytes, as PB does, never taken from the client. */
+const PNG = [137, 80, 78, 71, 13, 10, 26, 10];
+const png = (name = "Foto Capa.PNG") => new File([new Uint8Array(PNG)], name, { type: "image/png" });
 const txt = (name: string, body = "oi") => new File([body], name, { type: "text/plain" });
 
 async function setup() {
@@ -80,7 +82,7 @@ Deno.test("multipart create stores uploads, casts fields and the file serves wit
   assertEquals(res.status, 200);
   assertEquals(res.headers.get("content-type"), "image/png");
   assertEquals(res.headers.get("content-disposition"), `inline; filename="${r.json.capa}"`);
-  assertEquals(new Uint8Array(await res.arrayBuffer()), new Uint8Array([137, 80, 78, 71]));
+  assertEquals(new Uint8Array(await res.arrayBuffer()), new Uint8Array(PNG));
   const dl = await t.app.http.request(`/api/files/fl_docs/${r.json.id}/${r.json.capa}?download=1`);
   assert(dl.headers.get("content-disposition")!.startsWith("attachment"));
   await dl.body?.cancel();
@@ -98,6 +100,27 @@ Deno.test("file checks answer PB's codes: type, size, count and names the client
   assertEquals(r.json.data.anexos.code, "validation_too_many_files");
   r = await t.send("POST", base, { capa: "alheio.png" });
   assertEquals(r.json.data.capa.code, "validation_invalid_file");
+});
+
+Deno.test("the file type is sniffed from the content like PB: the client's type and the name do not count", async () => {
+  const t = await setup();
+  const base = "/api/collections/fl_docs/records";
+  // Text claimed as a PNG is refused with PB's message.
+  let r = await t.send("POST", base, t.fd([["capa", new File(["oi"], "f.png", { type: "image/png" })]]));
+  assertEquals(r.json.data.capa, {
+    code: "validation_invalid_mime_type",
+    message: '"f.png" mime type must be one of: image/png.',
+  });
+  // A real PNG sent as text/plain passes, and is stored as image/png.
+  r = await t.send("POST", base, t.fd([["capa", new File([new Uint8Array(PNG)], "f.bin", { type: "text/plain" })]]));
+  assertEquals(r.status, 200);
+  assertEquals(t.storage.files.get(`${collectionId(fl_docs)}/${r.json.id}/${r.json.capa}`)?.type, "image/png");
+  // Without mimeTypes anything goes, and the stored type is still the sniffed one.
+  r = await t.send("POST", base, t.fd([["anexos", new File(['{"a":1}'], "x.png", { type: "image/png" })]]));
+  assertEquals(
+    t.storage.files.get(`${collectionId(fl_docs)}/${r.json.id}/${r.json.anexos[0]}`)?.type,
+    "application/json",
+  );
 });
 
 Deno.test("modifiers append and remove files; replaced and deleted files leave storage after commit", async () => {
@@ -199,8 +222,8 @@ Deno.test("files serve like Go's http.ServeContent: ranges, 416 and conditionals
   assertEquals(Number(multi.headers.get("content-length")), new TextEncoder().encode(body).byteLength);
   assertEquals(
     body,
-    `--${boundary}\r\nContent-Range: bytes 0-0/10\r\nContent-Type: text/plain\r\n\r\n0` +
-      `\r\n--${boundary}\r\nContent-Range: bytes 8-9/10\r\nContent-Type: text/plain\r\n\r\n89\r\n--${boundary}--\r\n`,
+    `--${boundary}\r\nContent-Range: bytes 0-0/10\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n0` +
+      `\r\n--${boundary}\r\nContent-Range: bytes 8-9/10\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n89\r\n--${boundary}--\r\n`,
   );
 
   const past = await get({ Range: "bytes=20-" });
