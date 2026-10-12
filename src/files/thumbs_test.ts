@@ -422,6 +422,36 @@ Deno.test("ThumbPool renders off thread, transfers the input, and replaces a wor
   }
 });
 
+Deno.test("ThumbPool frees a seat at once when its running job is aborted, and drops listeners of settled jobs", async () => {
+  const pool = new ThumbPool(1, 30_000);
+  try {
+    const ac = new AbortController();
+    const running = pool.render(pngOf(twoTone(3000, 3000, "lr")), "image/png", "100x100", ac.signal);
+    const queued = pool.render(pngOf(twoTone(40, 20, "lr")), "image/png", "10x10");
+    await new Promise((r) => setTimeout(r, 5));
+    ac.abort();
+    await assertRejects(() => running, Error, "canceled");
+    // The worker was terminated, so the queued job runs on a fresh one instead of waiting out the decode.
+    const t0 = performance.now();
+    assertEquals((await decodeImage((await queued).bytes)).width, 10);
+    assert(performance.now() - t0 < 5_000);
+    assertEquals(pool.spawned, 2);
+
+    // A long-lived signal shared by many renders keeps no listener once each job settles.
+    let live = 0;
+    const shared = new AbortController();
+    const add = shared.signal.addEventListener.bind(shared.signal);
+    const remove = shared.signal.removeEventListener.bind(shared.signal);
+    shared.signal.addEventListener = ((...a: Parameters<typeof add>) => (live++, add(...a))) as typeof add;
+    shared.signal.removeEventListener = ((...a: Parameters<typeof remove>) => (live--, remove(...a))) as typeof remove;
+    for (let i = 0; i < 3; i++) await pool.render(pngOf(twoTone(40, 20, "lr")), "image/png", "10x10", shared.signal);
+    await assertRejects(() => pool.render(new Uint8Array([1]), "image/png", "10x10", shared.signal));
+    assertEquals(live, 0);
+  } finally {
+    pool.close();
+  }
+});
+
 Deno.test("Thumbs.cancel stops in-flight generations for a file and awaits them before its thumbs are swept", async () => {
   const storage = new MemoryStorage();
   await storage.put("c/r/a.png", pngOf(twoTone(20, 20, "lr")), { type: "image/png" });

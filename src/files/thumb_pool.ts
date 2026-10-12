@@ -23,7 +23,8 @@ interface Pending {
   job: ThumbJob;
   resolve: (r: { bytes: Uint8Array; type: string }) => void;
   reject: (e: Error) => void;
-  signal?: AbortSignal;
+  /** Removes the abort listener once the job settles, so a long-lived signal keeps no finished job alive. */
+  unlisten?: () => void;
 }
 
 interface Seat {
@@ -47,7 +48,8 @@ export class ThumbPool {
 
   /**
    * Renders in a worker. `bytes` is transferred: the caller's buffer is detached afterwards. An aborted signal drops
-   * a queued job and rejects a running one at once (the worker finishes it and the result is discarded).
+   * a queued job, and for a running one terminates its worker: the seat frees at once, so a caller's semaphore that
+   * releases on the rejection never counts a seat the pool still holds.
    */
   render(
     bytes: Uint8Array,
@@ -57,12 +59,35 @@ export class ThumbPool {
   ): Promise<{ bytes: Uint8Array; type: string }> {
     if (signal?.aborted) return Promise.reject(new Error("thumb generation canceled"));
     return new Promise((resolve, reject) => {
-      const p: Pending = { job: { id: this.#nextId++, bytes, type, size }, resolve, reject, signal };
-      signal?.addEventListener("abort", () => {
-        const q = this.#queue.indexOf(p);
-        if (q >= 0) this.#queue.splice(q, 1);
-        reject(new Error("thumb generation canceled"));
-      }, { once: true });
+      const p: Pending = {
+        job: { id: this.#nextId++, bytes, type, size },
+        resolve: (r) => {
+          p.unlisten?.();
+          resolve(r);
+        },
+        reject: (e) => {
+          p.unlisten?.();
+          reject(e);
+        },
+      };
+      if (signal) {
+        const onAbort = () => {
+          const err = new Error("thumb generation canceled");
+          const q = this.#queue.indexOf(p);
+          if (q >= 0) {
+            this.#queue.splice(q, 1);
+            p.reject(err);
+            return;
+          }
+          const seat = this.#seats.find((s) => s.busy === p);
+          if (seat) {
+            this.#retire(seat, err);
+            this.#pump();
+          }
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        p.unlisten = () => signal.removeEventListener("abort", onAbort);
+      }
       this.#queue.push(p);
       this.#pump();
     });
