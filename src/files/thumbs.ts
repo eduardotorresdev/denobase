@@ -9,8 +9,8 @@ import { decodeImage, encodeImage, fill, fit, MAX_THUMB_SIDE, resize } from "./i
  * local and S3 alike, and the files migration moves them with the record dir).
  */
 
-/** PB's filesystem.ThumbSizeRegex. */
-export const THUMB_SIZE_RE = /^(\d+)x(\d+)(t|b|f)?$/;
+import { THUMB_SIZE_RE } from "./thumb_size.ts";
+export { THUMB_SIZE_RE };
 /** PB's defaultThumbSizes: always allowed, whatever the field's thumbs option says. */
 export const DEFAULT_THUMB_SIZES = ["100x100"];
 /** PB's imageContentTypes: only these originals get a thumb; anything else is served as is. */

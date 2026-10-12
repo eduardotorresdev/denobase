@@ -1,6 +1,7 @@
 // Helpers shared by the collections, records and recordForm pages.
 import { findCollection, loadCollections } from "../../store.js";
 import { badge, formatDate, jsonView, modal } from "../../ui.js";
+import { thumbsEditor } from "../../thumbs.js";
 
 /** Badge kind per collection type. */
 export function typeBadge(type) {
@@ -35,6 +36,14 @@ export function openSchema(col) {
             ),
           ),
         ),
+      ),
+      // Thumbs are edited where they can be: the declaration in code. The editor checks them like the server does.
+      (col.fields || []).filter((f) => f.type === "file").map((f) =>
+        t.details(
+          { open: (f.thumbs || []).length > 0 },
+          t.summary({ textContent: `Thumbs of ${f.name}` }),
+          thumbsEditor(f.thumbs || []),
+        )
       ),
       t.details({}, t.summary({ textContent: "Raw JSON" }), jsonView(col)),
     ),

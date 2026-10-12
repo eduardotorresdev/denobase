@@ -1,9 +1,12 @@
-import type { Hono } from "hono";
+import type { Context, Hono } from "hono";
 import type { AppEnv, Ctx } from "./app.ts";
 import { badRequest, notFound } from "../core/errors.ts";
 import { getCollection } from "../core/registry.ts";
 import { exportCollection, scaffolds } from "../collections/export.ts";
 import { superuser } from "./guards.ts";
+import { collectionValidationError, fieldsOptionsErrors, importValidationError } from "../core/field_options.ts";
+
+type Ctx2 = Context<AppEnv>;
 
 const READ_ONLY = "Collections are declared in code and cannot be changed through the API.";
 
@@ -43,12 +46,28 @@ export function collectionRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
     return c.json(exportCollection(col, ctx.collections));
   });
 
-  const refuse = () => {
+  const refuse = (): never => {
     throw badRequest(READ_ONLY);
   };
-  app.post("/api/collections", superuser, refuse);
-  app.put("/api/collections/import", superuser, refuse);
-  app.patch("/api/collections/:c", superuser, refuse);
+  // A body PB would reject for its field settings gets PB's validation error first, so a client sees the same
+  // answer it would from PB; only a valid one learns the collection is declared in code.
+  const validated = (message: string) => async (c: Ctx2) => {
+    const body = await c.req.json().catch(() => null) as { fields?: unknown } | null;
+    const errs = fieldsOptionsErrors(body?.fields);
+    if (errs) throw collectionValidationError(message, errs);
+    refuse();
+  };
+  app.post("/api/collections", superuser, validated("Failed to create collection."));
+  app.put("/api/collections/import", superuser, async (c) => {
+    const body = await c.req.json().catch(() => null) as { collections?: unknown } | null;
+    const list = Array.isArray(body?.collections) ? body.collections : [];
+    for (const col of list as { name?: unknown; id?: unknown; fields?: unknown }[]) {
+      const errs = fieldsOptionsErrors(col?.fields);
+      if (errs) throw importValidationError(String(col.name ?? ""), String(col.id ?? ""), errs);
+    }
+    refuse();
+  });
+  app.patch("/api/collections/:c", superuser, validated("Failed to update collection."));
   app.delete("/api/collections/:c", superuser, refuse);
   app.delete("/api/collections/:c/truncate", superuser, refuse);
 }
