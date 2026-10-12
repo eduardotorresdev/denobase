@@ -2,6 +2,7 @@ import { assert, assertEquals } from "@std/assert";
 import { DatabaseSync } from "node:sqlite";
 import { unzipSync } from "fflate";
 import { Backups } from "./mod.ts";
+import { readAll } from "../files/storage.ts";
 
 Deno.test("create on file dbs zips off the main thread: the loop keeps ticking while it runs", async () => {
   const dir = await Deno.makeTempDir();
@@ -24,7 +25,7 @@ Deno.test("create on file dbs zips off the main thread: the loop keeps ticking w
     clearInterval(timer);
     assert(ticks > 0, "the event loop was blocked for the whole backup");
 
-    const zip = unzipSync(await backups.read("b.zip"));
+    const zip = unzipSync(await readAll((await backups.get("b.zip"))!.body));
     assertEquals(Object.keys(zip).sort(), ["auxiliary.db", "data.db", "storage/f.txt"]);
     assertEquals(backups.active, null);
   } finally {

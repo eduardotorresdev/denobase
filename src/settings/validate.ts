@@ -32,6 +32,21 @@ export function validateSettings(s: Settings): Errs {
     if (!s.smtp.host) add("smtp", "host", required());
     if (!s.smtp.port) add("smtp", "port", required());
   }
+  // PB S3Config.Validate: every connection field is required once enabled, the endpoint a URL.
+  const s3Errs = (c: Settings["s3"]) => {
+    const out: Record<string, unknown> = {};
+    if (!c.enabled) return out;
+    for (const k of ["endpoint", "bucket", "region", "accessKey", "secret"] as const) if (!c[k]) out[k] = required();
+    // Like ozzo is.URL, a bare host ("s3.example.com") is a URL too.
+    if (c.endpoint && !URL.canParse(c.endpoint) && !URL.canParse(`https://${c.endpoint}`)) {
+      out.endpoint = err("validation_is_url", "Must be a valid URL.");
+    }
+    return out;
+  };
+  const filesS3 = s3Errs(s.s3);
+  if (Object.keys(filesS3).length) errs.s3 = filesS3;
+  const backupsS3 = s3Errs(s.backups.s3);
+  if (Object.keys(backupsS3).length) (errs.backups ??= {}).s3 = backupsS3;
   for (const [k, v] of [["maxRequests", s.batch.maxRequests], ["timeout", s.batch.timeout]] as const) {
     if (v < 0) add("batch", k, err("validation_min_greater_equal_than_required", "Must be no less than 0."));
   }

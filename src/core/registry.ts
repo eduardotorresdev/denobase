@@ -2,6 +2,7 @@ import type { CollectionConfig } from "./types.ts";
 import { superusers } from "./superusers.ts";
 import { notFound } from "./errors.ts";
 import { deriveViewFields } from "../view/mod.ts";
+import { assertCollectionOptions } from "./field_options.ts";
 
 /**
  * Source of truth for migrate create (diff), the HTTP router and auth. Starts with the system collections; the
@@ -16,6 +17,8 @@ export const collections: CollectionConfig[] = [superusers];
 export function registerCollections(...cs: CollectionConfig[]): void {
   for (const c of cs) {
     if (collections.some((x) => x.slug === c.slug)) continue;
+    // Configs need not come through defineCollection, so the settings are checked again here.
+    assertCollectionOptions(c);
     collections.push(c);
     if (c.view) c.fields = deriveViewFields(c.view, collections);
   }

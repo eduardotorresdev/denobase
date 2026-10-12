@@ -75,6 +75,8 @@ export const foldText = (s: string): string => s.normalize("NFD").replace(/\p{M}
 interface Frame {
   db: DatabaseSync;
   afterCommit: (() => void)[];
+  /** Callbacks run if this level, or any level around it, rolls back; handed to the parent on release. */
+  afterRollback: (() => void)[];
   /** The outermost level of this transaction, where beforeCommit work is queued; undefined on that level. */
   root?: Frame;
   /** Root only: work keyed for dedup, run inside the transaction right before it commits. */
@@ -111,6 +113,16 @@ export function afterCommit(db: DatabaseSync, fn: () => void): void {
   const frame = inTx.getStore();
   if (frame?.db === db) frame.afterCommit.push(fn);
   else fn();
+}
+
+/**
+ * Runs fn once the transaction level around the caller rolls back (its own savepoint or any level above it that
+ * later fails, commit included); dropped once the outermost level commits. Outside a transaction it never runs.
+ * Undo of side effects made outside the db (uploaded files) goes through here.
+ */
+export function afterRollback(db: DatabaseSync, fn: () => void): void {
+  const frame = inTx.getStore();
+  if (frame?.db === db) frame.afterRollback.push(fn);
 }
 
 /**
@@ -169,6 +181,7 @@ async function run<T>(
   const frame: Frame = {
     db,
     afterCommit: [],
+    afterRollback: [],
     root: parent ? parent.root ?? parent : undefined,
     beforeCommit: new Map(),
   };
@@ -186,12 +199,18 @@ async function run<T>(
     });
     db.exec(nested ? `RELEASE ${sp}` : "COMMIT");
   } catch (e) {
-    db.exec(nested ? `ROLLBACK TO ${sp}; RELEASE ${sp}` : "ROLLBACK");
+    try {
+      db.exec(nested ? `ROLLBACK TO ${sp}; RELEASE ${sp}` : "ROLLBACK");
+    } finally {
+      for (const f of frame.afterRollback) f();
+    }
     throw e;
   }
   // Under a hand-opened BEGIN the commit is not ours to see, so callbacks run when this level releases.
-  if (parent) parent.afterCommit.push(...frame.afterCommit);
-  else {
+  if (parent) {
+    parent.afterCommit.push(...frame.afterCommit);
+    parent.afterRollback.push(...frame.afterRollback);
+  } else {
     if (frame.afterCommit.length) span?.addEvent("afterCommit", { callbacks: frame.afterCommit.length });
     for (const f of frame.afterCommit) f();
   }

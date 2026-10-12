@@ -2311,3 +2311,59 @@ a.list-row:hover {
 .tz-now {
   font-size: 12px;
 }
+
+/* Files migration (settings > Files storage). */
+.migration-progress {
+  width: 100%;
+  height: 8px;
+  accent-color: var(--accent);
+}
+.migration-question {
+  font-weight: 600;
+}
+.migration-failures {
+  max-height: 200px;
+  overflow: auto;
+  font-size: 12px;
+}
+/* Tags input (file field thumbs): chips and the text box share one bordered line that wraps. */
+.tags-input {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+  height: auto;
+  min-height: 32px;
+  padding: 3px 6px;
+}
+.tags-input .tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 22px;
+  padding: 0 4px 0 8px;
+  border: 1px solid var(--g3);
+  border-radius: 999px;
+  font-size: 12px;
+}
+.tags-input .tag.invalid {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+.tags-input .tag-x {
+  border: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  padding: 0 3px;
+}
+.tags-input-text {
+  flex: 1;
+  min-width: 120px;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}

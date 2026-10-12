@@ -43,7 +43,8 @@ Deno.test("admin: crons list and run; logs list and stats", async () => {
   const jobs = structured(await c.callTool({ name: "db_crons_list", arguments: {} }));
   assert((jobs.items as { id: string }[]).some((j) => j.id === "mt_job"));
   await c.callTool({ name: "db_crons_run", arguments: { id: "mt_job" } });
-  await new Promise((r) => setTimeout(r, 10));
+  // The run may complete after the tool returns; poll instead of a fixed delay.
+  for (let i = 0; i < 200 && ran === 0; i++) await new Promise((r) => setTimeout(r, 5));
   assertEquals(ran, 1);
   const missing = await c.callTool({ name: "db_crons_run", arguments: { id: "nope" } });
   assertEquals(structured(missing).status, 404);

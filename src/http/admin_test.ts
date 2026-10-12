@@ -174,7 +174,18 @@ Deno.test("backups: create, list, download with a superuser file token, upload, 
   assertEquals((await t.app.http.request(`/api/backups/manual.zip?token=${userFileToken}`)).status, 403);
   const dl = await t.app.http.request(`/api/backups/manual.zip?token=${fileToken}`);
   assertEquals([dl.status, dl.headers.get("content-type")], [200, "application/zip"]);
-  await dl.body?.cancel();
+  assertEquals(dl.headers.get("accept-ranges"), "bytes");
+  assert(dl.headers.get("last-modified"));
+  const whole = new Uint8Array(await dl.arrayBuffer());
+  // A resumed download (curl -C -) gets the tail as a 206, like PB's http.ServeContent.
+  const part = await t.app.http.request(`/api/backups/manual.zip?token=${fileToken}`, {
+    headers: { Range: "bytes=10-" },
+  });
+  assertEquals(
+    [part.status, part.headers.get("content-range")],
+    [206, `bytes 10-${whole.length - 1}/${whole.length}`],
+  );
+  assertEquals(new Uint8Array(await part.arrayBuffer()), whole.slice(10));
 
   const up = new FormData();
   up.append("file", new File(["not a zip"], "x.zip"));
@@ -185,6 +196,12 @@ Deno.test("backups: create, list, download with a superuser file token, upload, 
     new File([zipSync({ "data.db": new Uint8Array([1]) }) as Uint8Array<ArrayBuffer>], "enviado.zip"),
   );
   assertEquals((await t.call("POST", "/api/backups/upload", good)).status, 204);
+  // Spooled to disk and streamed on: the stored zip is byte for byte the upload.
+  const back = await t.app.http.request(`/api/backups/enviado.zip?token=${fileToken}`);
+  assertEquals(
+    new Uint8Array(await back.arrayBuffer()),
+    new Uint8Array(await (good.get("file") as File).arrayBuffer()),
+  );
   assertEquals((await t.call("DELETE", "/api/backups/enviado.zip")).status, 204);
   assertEquals((await t.call("DELETE", "/api/backups/enviado.zip")).status, 400);
 

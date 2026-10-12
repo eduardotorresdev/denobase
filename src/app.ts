@@ -14,7 +14,10 @@ import { type AppEnv, createHttp, type Ctx } from "./http/app.ts";
 import { defaultServices, type Services } from "./http/services.ts";
 import { Realtime } from "./realtime/mod.ts";
 import { createStore, type Store } from "./store/mod.ts";
-import type { Storage } from "./files/storage.ts";
+import { type BlobStore, MemoryStorage } from "./files/storage.ts";
+import { CurrentStorage } from "./files/current.ts";
+import { FILES_MIGRATION_TOPIC, FilesMigrations } from "./files/migrate.ts";
+import { PROGRESS_OP } from "./files/tasks/migrate.ts";
 import { loadSettings, resolveSettings, type Settings, type SettingsPatch } from "./settings/mod.ts";
 import { bundledUi, diskUi } from "./http/ui_source.ts";
 import { McpHost } from "./mcp/host.ts";
@@ -33,7 +36,7 @@ export interface AppOptions {
   /** Overrides for route tests; production uses the real engine and auth. */
   services?: Partial<Services>;
   /** Where record files live; defaults to memory (serve passes pb_data/storage on disk). */
-  storage?: Storage;
+  storage?: BlobStore;
   /** PB's auxiliary db (logs); defaults to memory (serve passes pb_data/auxiliary.db). */
   auxDb?: DatabaseSync;
   /** pb_data on disk: enables backups (zips of the dbs and storage/ kept in <dataDir>/backups). */
@@ -72,6 +75,8 @@ export interface App {
    */
   readonly jobs: JobRunner;
   readonly backups: Backups | null;
+  /** Moving record files to the storage settings.s3 names now (job state in the auxiliary db). */
+  readonly filesMigration: FilesMigrations;
   /** The Hono app, for mounting next to other routes and for app.http.request in tests. */
   readonly http: Hono<AppEnv>;
   /** Web-standard handler: Deno.serve(app.fetch). */
@@ -88,7 +93,9 @@ export function createApp(opts: AppOptions): App {
   const { db } = opts;
   // A db the caller opened itself (not through openDb) still needs the SQL functions filters compile to (fold).
   ensureMathFunctions(db);
-  const store = createStore(db, opts.storage);
+  // The store keeps one storage for its life; settings.s3 decides what is behind it (see the swap below).
+  const files = new CurrentStorage(opts.storage ?? new MemoryStorage());
+  const store = createStore(db, files);
   const mailer = opts.mailer ?? mailerFromEnv();
   const s: Services = { ...defaultServices, ...opts.services };
   const realtime = new Realtime(store, s);
@@ -98,7 +105,9 @@ export function createApp(opts: AppOptions): App {
   // Other threads on the same file (job worker, HTTP isolates): their record writes reach this thread's realtime and
   // remote listeners, and a settings change saved by one reaches the others.
   const stopSharing = shared ? shareRecordEvents(db, shared) : () => {};
-  const onSettingsChange: ((s: Settings) => void)[] = [];
+  files.use(settings.s3);
+  // PB builds its filesystem from settings.s3 on each use: a saved change applies to the next file operation.
+  const onSettingsChange: ((s: Settings) => void)[] = [(s) => files.use(s.s3)];
   let settingsStamp = settingsUpdated(db);
   // The baseline: what was committed before this app existed is already in what it loaded.
   syncExternalCommits(db);
@@ -124,9 +133,25 @@ export function createApp(opts: AppOptions): App {
       (module, input) => jobs.inWorker ? jobs.run({ module }, input) : runTask(module, input),
     )
     : null;
+  const filesMigration = new FilesMigrations({
+    aux: logs.db,
+    data: db,
+    storage: files,
+    s3: () => settings.s3,
+    launch: (id) => jobs.run({ module: MIGRATE_TASK }, { id }),
+  });
+  // The run lives in the worker, the subscribers here: progress comes back to be published on this realtime.
+  jobs.operation(
+    PROGRESS_OP,
+    (_store, state: unknown) =>
+      realtime.publish(FILES_MIGRATION_TOPIC, state, { access: ({ auth }) => auth?.collection === "_superusers" }),
+  );
   const cron = new Cron(() => settings.meta.timezone, tracer);
   cron.useRunner(jobs);
   systemJobs(cron, db, logs, settings);
+  // settings.backups.s3 picks where zips go, swapped on every settings change like the files storage.
+  backups?.use(settings.backups.s3, settings.s3);
+  if (backups) onSettingsChange.push((s) => backups.use(s.backups.s3, s.s3));
   const reloadAutoBackups = autoBackups(cron, backups, settings);
   onSettingsChange.push(reloadAutoBackups);
   const mcp = new McpHost(opts.mcp);
@@ -148,6 +173,7 @@ export function createApp(opts: AppOptions): App {
     traces,
     cron,
     backups,
+    filesMigration,
     adminUi: opts.adminUiDir === false
       ? undefined
       : typeof opts.adminUiDir === "string"
@@ -187,6 +213,7 @@ export function createApp(opts: AppOptions): App {
     cron,
     jobs,
     backups,
+    filesMigration,
     http,
     fetch: http.fetch,
     mcp,
@@ -196,6 +223,8 @@ export function createApp(opts: AppOptions): App {
   mcp.attach(app, ctx);
   return app;
 }
+
+const MIGRATE_TASK = new URL("./files/tasks/migrate.ts", import.meta.url);
 
 /** When the saved settings last changed ('' before the first save): a cheap read to tell a settings commit apart. */
 function settingsUpdated(db: DatabaseSync): string {

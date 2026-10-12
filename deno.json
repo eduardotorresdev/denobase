@@ -1,6 +1,6 @@
 {
   "name": "@denobase/denobase",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "exports": {
     ".": "./mod.ts",
     "./testing": "./src/testing/mod.ts"
@@ -25,7 +25,11 @@
     "@modelcontextprotocol/server/stdio": "npm:@modelcontextprotocol/server@2.3.1/stdio",
     "@modelcontextprotocol/client": "npm:@modelcontextprotocol/client@2.3.1",
     "@modelcontextprotocol/client/stdio": "npm:@modelcontextprotocol/client@2.3.1/stdio",
-    "@std/encoding": "jsr:@std/encoding@^1"
+    "@std/encoding": "jsr:@std/encoding@^1",
+    "fast-png": "npm:fast-png@^8.0.0",
+    "jpeg-js": "npm:jpeg-js@^0.4.4",
+    "omggif": "npm:omggif@^1.0.10",
+    "@jsquash/webp": "npm:@jsquash/webp@^1.5.0"
   },
   "fmt": {
     "lineWidth": 120,

@@ -1,6 +1,7 @@
+import { thumbsDir, thumbsFor } from "../files/thumbs.ts";
 import { type ChangedItem, type CollectionConfig, type Doc, LOCKED, type Req } from "../core/types.ts";
 import { badRequest, notFound } from "../core/errors.ts";
-import { afterCommit, tx } from "../core/db.ts";
+import { afterCommit, afterRollback, tx } from "../core/db.ts";
 import * as sql from "../store/sqlite.ts";
 import { allFields } from "./fields.ts";
 import { validate } from "./validate.ts";
@@ -46,13 +47,14 @@ async function createRecord(a: WriteArgs): Promise<Doc> {
     data = known(c, await runCollHooks(req, c, "beforeValidate", data, "create"));
     const id = recordId(req, c, a.data.id, a.overrideAccess);
     const errs = {};
-    const files = prepareFiles(c, data, undefined, errs);
+    const files = await prepareFiles(c, data, undefined, errs);
     validate(c, data, "create", errs);
     checkDb(req, c, data, "create", id);
     await runFieldHooks(req, c, "beforeChange", data, "create");
     data = known(c, await runCollHooks(req, c, "beforeChange", data, "create"));
-    sql.insert(req.db, c, id, data);
+    // PB's FileField uploads before the row is written and deletes the new files if the save or commit fails.
     await storeFiles(req, c, id, files);
+    sql.insert(req.db, c, id, data);
     let doc = loadRaw(req, c, id)!;
     const after = c.hooks?.afterChange ?? [];
     doc = await traceHook(c, "afterChange", after.length, async () => {
@@ -107,13 +109,13 @@ async function applyUpdate(c: CollectionConfig, req: Req, a: WriteArgs & { id: s
   await runFieldHooks(req, c, "beforeValidate", data, "update", original);
   data = known(c, await runCollHooks(req, c, "beforeValidate", data, "update", original));
   const errs = {};
-  const files = prepareFiles(c, data, original, errs);
+  const files = await prepareFiles(c, data, original, errs);
   validate(c, { ...original, ...data }, "update", errs);
   checkDb(req, c, data, "update", a.id);
   await runFieldHooks(req, c, "beforeChange", data, "update", original);
   data = known(c, await runCollHooks(req, c, "beforeChange", data, "update", original));
-  sql.update(req.db, c, a.id, data);
   await storeFiles(req, c, a.id, files);
+  sql.update(req.db, c, a.id, data);
   let doc = loadRaw(req, c, a.id)!;
   const after = c.hooks?.afterChange ?? [];
   doc = await traceHook(c, "afterChange", after.length, async () => {
@@ -241,7 +243,18 @@ async function removeRecord(a: Omit<WriteArgs, "data"> & { id: string }): Promis
     sql.remove(req.db, c, a.id);
     forgetFoundRelations(req);
     // PB deletes a record's files only once the delete is committed.
-    if (fileNames(c, doc).length) afterCommit(req.db, () => void req.store.storage.deletePrefix(recordDir(c, a.id)));
+    if (fileNames(c, doc).length) {
+      const dir = recordDir(c, a.id);
+      const { storage } = req.store;
+      // In-flight thumb generations of this record are canceled and awaited first, so none lands after the sweep.
+      afterCommit(
+        req.db,
+        () =>
+          void thumbsFor(storage).cancel(dir).then(() => storage.deletePrefix(dir)).catch((e) =>
+            logFileDeleteError(dir, e)
+          ),
+      );
+    }
     const after = c.hooks?.afterDelete ?? [];
     await traceHook(c, "afterDelete", after.length, async () => {
       for (const h of after) await h({ req, collection: c, id: a.id, doc });
@@ -249,14 +262,45 @@ async function removeRecord(a: Omit<WriteArgs, "data"> & { id: string }): Promis
   });
 }
 
-/** Uploads inside the write's tx (a failed upload rolls the row back); dropped files go only after commit. */
+/**
+ * After commit the record is gone and nobody awaits the cleanup: a storage failure (S3 down, 5xx) must only be
+ * logged, as PB does, since an unhandled rejection would end the process.
+ */
+function logFileDeleteError(key: string, e: unknown): void {
+  console.error("Failed to delete files", key, e);
+}
+
+/**
+ * PB FileField's save interceptor: uploads before the row is written, inside the tx; if the upload, the write or the
+ * commit fails the newly uploaded files are deleted (a partial upload included), and dropped files go only after
+ * commit.
+ */
 async function storeFiles(req: Req, c: CollectionConfig, id: string, files: FileChanges): Promise<void> {
   const { storage } = req.store;
   const dir = recordDir(c, id);
+  const uploaded: string[] = [];
+  if (files.uploads.length) {
+    afterRollback(req.db, () => {
+      for (const key of uploaded) void storage.delete(key).catch((e) => logFileDeleteError(key, e));
+    });
+  }
   for (const u of files.uploads) {
-    await storage.put(dir + u.name, { data: new Uint8Array(await u.file.arrayBuffer()), type: u.file.type });
+    const key = dir + u.name;
+    // Listed before the put: a put that fails midway may still have left an object behind.
+    uploaded.push(key);
+    await storage.put(key, u.file.stream(), { type: u.type });
   }
   if (files.removed.length) {
-    afterCommit(req.db, () => void Promise.all(files.removed.map((n) => storage.delete(dir + n))));
+    afterCommit(req.db, () => {
+      for (const n of files.removed) {
+        void storage.delete(dir + n).catch((e) => logFileDeleteError(dir + n, e));
+        // PB's FileField deletes the file's thumbs with it; generations still running for the file are canceled and
+        // awaited first, or one finishing after the sweep would leave an orphaned thumb.
+        const thumbs = dir + thumbsDir(n);
+        void thumbsFor(storage).cancel(thumbs).then(() => storage.deletePrefix(thumbs)).catch((e) =>
+          console.warn("Failed to delete file thumbs", thumbs, e)
+        );
+      }
+    });
   }
 }

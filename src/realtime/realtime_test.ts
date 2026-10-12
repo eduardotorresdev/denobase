@@ -307,7 +307,8 @@ Deno.test("a disconnect hook runs once when the stream closes, with the client's
   console.error = () => {};
   try {
     await sse.cancel();
-    await new Promise((r) => setTimeout(r, 10));
+    // The server notices the closed stream asynchronously; wait for it instead of a fixed delay.
+    for (let i = 0; i < 200 && t.realtime.clients.has(clientId); i++) await new Promise((r) => setTimeout(r, 5));
   } finally {
     console.error = err;
   }

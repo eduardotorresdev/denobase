@@ -4,6 +4,8 @@ import type { CollectionConfig, Field } from "../core/types.ts";
 import { badRequest } from "../core/errors.ts";
 import { allFields } from "../engine/fields.ts";
 import { isMany as isMultiple } from "../schema/mod.ts";
+import { DEFAULT_MAX_SIZE } from "../engine/files.ts";
+import { boundaryOf, spoolMultipart } from "../files/spool.ts";
 
 /** PB tools/router JSONPayloadKey: a JSON object sent alongside multipart fields and files. */
 export const JSON_PAYLOAD = "@jsonPayload";
@@ -52,6 +54,15 @@ function fieldOf(c: CollectionConfig | undefined, key: string): Field | undefine
   return c && allFields(c).find((f) => f.name === name);
 }
 
+/**
+ * Bytes of a file part kept on disk: the field's maxSize (PB's default when unset). Anything past it is only
+ * counted, which is enough for validation to fail with the size sent; a part under a non-file key keeps none.
+ */
+export function uploadLimit(f: Field | undefined): number {
+  if (f?.type !== "file") return 0;
+  return f.maxSize && f.maxSize > 0 ? f.maxSize : DEFAULT_MAX_SIZE;
+}
+
 /** Groups a FormData by key, PB's url.Values. */
 export function formEntries(form: FormData): Map<string, (string | File)[]> {
   const out = new Map<string, (string | File)[]>();
@@ -83,7 +94,10 @@ export async function readBody(c: Context<AppEnv>, col?: CollectionConfig): Prom
   if (type.startsWith("multipart/form-data") || type.startsWith("application/x-www-form-urlencoded")) {
     let form: FormData;
     try {
-      form = await c.req.raw.formData();
+      const boundary = boundaryOf(type);
+      form = boundary
+        ? await spoolMultipart(c.req.raw.body, boundary, (key) => uploadLimit(fieldOf(col, key)))
+        : await c.req.raw.formData();
     } catch {
       throw badRequest(INVALID);
     }

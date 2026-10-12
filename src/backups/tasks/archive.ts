@@ -2,6 +2,9 @@ import { tuneConnection } from "../../core/db.ts";
 import { backup, DatabaseSync } from "node:sqlite";
 import { Zip, ZipDeflate } from "fflate";
 import { excluded } from "../archive.ts";
+import { pruneBackups, writeBackup } from "../store.ts";
+import { storageFromSettings } from "../../files/current.ts";
+import type { S3Config } from "../../settings/model.ts";
 import type { JobContext } from "../../jobs/context.ts";
 import type { Attrs, Span } from "../../telemetry/span.ts";
 
@@ -9,8 +12,12 @@ export interface ArchiveInput {
   dataDir: string;
   /** Zip entry name -> db file, each opened here on its own read-only connection. */
   dbPaths: Record<string, string>;
-  /** Where the zip goes; never overwritten. */
-  out: string;
+  /** The backups store the zip goes to, rebuilt here: settings.backups.s3 when enabled, else the local dir. */
+  store: { dir: string; s3: S3Config | null };
+  /** The zip's key in it; never overwritten. */
+  key: string;
+  /** pb_data/storage is carried only while it holds the files (PB): with files on S3 it is a leftover. */
+  includeStorage: boolean;
   /** Retention after the zip is written: keep the newest `maxKeep` zips whose name starts with `prefix`. */
   prune?: { prefix: string; maxKeep: number };
 }
@@ -28,9 +35,11 @@ const CHUNK = 1 << 20;
  * - The online backup copies each db in ONE step (rate -1), under one read snapshot: in WAL a reader blocks no one,
  *   while a stepped backup restarts from page one whenever another connection commits (the main thread writes the
  *   auxiliary db on every request), re-reading the file over and over.
- * - The zip is streamed a MiB at a time from disk to disk: the dbs never sit whole in memory.
+ * - The zip is streamed a MiB at a time to the backups store (a local file, or an S3 multipart upload): the dbs
+ *   never sit whole in memory.
  */
 export default async function archiveTask(input: ArchiveInput, ctx?: JobContext): Promise<void> {
+  const store = storageFromSettings(input.store.s3 ?? { enabled: false } as S3Config, input.store.dir);
   const tmp = await Deno.makeTempDir();
   const totals: Attrs = {};
   try {
@@ -52,15 +61,17 @@ export default async function archiveTask(input: ArchiveInput, ctx?: JobContext)
       totals["backup.db_bytes"] = bytes;
     });
     await phase(ctx, "zip", async (s) => {
-      const files = [...copies, ...await listFiles(input.dataDir)];
-      const bytes = await zipTo(input.out, files);
-      s?.setAttributes({ "backup.files": files.length, "backup.bytes": bytes });
-      totals["backup.zip_bytes"] = bytes;
+      const skip = (top: string) => !input.includeStorage && top === "storage";
+      const files = [...copies, ...await listFiles(input.dataDir, skip)];
+      const counter = { bytes: 0 };
+      await writeBackup(store, input.key, zipStream(files, counter));
+      s?.setAttributes({ "backup.files": files.length, "backup.bytes": counter.bytes });
+      totals["backup.zip_bytes"] = counter.bytes;
     });
     if (input.prune) {
       const { prefix, maxKeep } = input.prune;
       await phase(ctx, "retencao", async (s) => {
-        const removed = await prune(input.out.slice(0, input.out.lastIndexOf("/")), prefix, maxKeep);
+        const removed = await pruneBackups(store, prefix, maxKeep);
         s?.setAttribute("backup.removed", removed);
       });
     }
@@ -71,72 +82,81 @@ export default async function archiveTask(input: ArchiveInput, ctx?: JobContext)
 }
 
 /** Every file under dataDir as [zip entry, path], skipping what a backup never carries. */
-async function listFiles(dir: string, prefix = "", out: [string, string][] = []): Promise<[string, string][]> {
+async function listFiles(
+  dir: string,
+  skip: (top: string) => boolean,
+  prefix = "",
+  out: [string, string][] = [],
+): Promise<[string, string][]> {
   for await (const e of Deno.readDir(dir)) {
-    if (!prefix && excluded(e.name)) continue;
+    if (!prefix && (excluded(e.name) || skip(e.name))) continue;
     const rel = prefix + e.name;
-    if (e.isDirectory) await listFiles(`${dir}/${e.name}`, `${rel}/`, out);
+    if (e.isDirectory) await listFiles(`${dir}/${e.name}`, skip, `${rel}/`, out);
     else if (e.isFile) out.push([rel, `${dir}/${e.name}`]);
   }
   return out;
 }
 
-/** Streams the files into a new zip at out (never overwritten); returns its size. */
-async function zipTo(out: string, files: [string, string][]): Promise<number> {
-  const file = await Deno.open(out, { createNew: true, write: true });
-  let size = 0;
-  let writing = Promise.resolve();
+/**
+ * The files as one zip stream, pulled: each pull deflates the next MiB, so the output's backpressure (a disk, or an
+ * S3 multipart part being sent) paces the reads and memory stays a few chunks whatever the backup's size.
+ */
+export function zipStream(files: [string, string][], counter: { bytes: number }): ReadableStream<Uint8Array> {
+  let ctl!: ReadableStreamDefaultController<Uint8Array>;
   let failed: unknown;
   const zip = new Zip((err, chunk) => {
     if (err) failed = err;
-    else {
-      size += chunk.byteLength;
-      writing = writing.then(() => writeAll(file, chunk));
+    else if (chunk.byteLength) {
+      counter.bytes += chunk.byteLength;
+      ctl.enqueue(chunk);
     }
   });
-  try {
-    for (const [name, path] of files) {
-      const entry = new ZipDeflate(name, { level: 6 });
-      zip.add(entry);
-      const src = await Deno.open(path);
+  let i = 0;
+  let src: Deno.FsFile | null = null;
+  let entry: ZipDeflate | null = null;
+  const buf = new Uint8Array(CHUNK);
+  const closeSrc = () => {
+    try {
+      src?.close();
+    } catch { /* already closed */ }
+    src = null;
+  };
+  return new ReadableStream<Uint8Array>({
+    start(c) {
+      ctl = c;
+    },
+    // A pull that enqueues nothing is not repeated by the stream, so it reads on until deflate emits or the zip ends.
+    async pull() {
       try {
-        const buf = new Uint8Array(CHUNK);
-        for (;;) {
+        const before = counter.bytes;
+        while (counter.bytes === before) {
+          if (!src) {
+            if (i >= files.length) {
+              zip.end();
+              if (failed) throw failed;
+              ctl.close();
+              return;
+            }
+            const [name, path] = files[i++];
+            entry = new ZipDeflate(name, { level: 6 });
+            zip.add(entry);
+            src = await Deno.open(path);
+          }
           const n = await src.read(buf);
-          if (n === null) break;
-          entry.push(buf.slice(0, n));
-          // Lets the output drain before the next MiB, so memory stays a few chunks.
-          await writing;
+          if (n === null) {
+            closeSrc();
+            entry!.push(new Uint8Array(0), true);
+          } else entry!.push(buf.slice(0, n));
+          if (failed) throw failed;
         }
-        entry.push(new Uint8Array(0), true);
-      } finally {
-        src.close();
+      } catch (e) {
+        closeSrc();
+        ctl.error(e);
       }
-    }
-    zip.end();
-    await writing;
-    if (failed) throw failed;
-  } finally {
-    file.close();
-  }
-  return size;
-}
-
-/** FsFile.write may take fewer bytes than given. */
-async function writeAll(file: Deno.FsFile, chunk: Uint8Array): Promise<void> {
-  for (let off = 0; off < chunk.byteLength;) off += await file.write(chunk.subarray(off));
-}
-
-/** PB autobackup pruning: keep the newest `maxKeep` files with the prefix; returns how many went. */
-async function prune(dir: string, prefix: string, maxKeep: number): Promise<number> {
-  if (maxKeep <= 0) return 0;
-  const auto: { name: string; mtime: number }[] = [];
-  for await (const e of Deno.readDir(dir)) {
-    if (!e.isFile || !e.name.startsWith(prefix)) continue;
-    auto.push({ name: e.name, mtime: (await Deno.stat(`${dir}/${e.name}`)).mtime?.getTime() ?? 0 });
-  }
-  auto.sort((a, b) => b.mtime - a.mtime);
-  const old = auto.slice(maxKeep);
-  for (const f of old) await Deno.remove(`${dir}/${f.name}`);
-  return old.length;
+    },
+    cancel() {
+      closeSrc();
+      zip.terminate();
+    },
+  });
 }

@@ -1,5 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { Store } from "../store/mod.ts";
+import { CurrentStorage } from "../files/current.ts";
 import { FsStorage } from "../files/storage.ts";
 import { currentSpan } from "../telemetry/context.ts";
 import { formatTraceparent } from "../telemetry/propagation.ts";
@@ -133,7 +134,9 @@ export class JobRunner {
         reject(err);
       };
     });
-    const storage = this.deps.store.storage;
+    // The worker builds its own app, which reads settings.s3 itself; what it needs is the local fallback.
+    const current = this.deps.store.storage;
+    const storage = current instanceof CurrentStorage ? current.local : current;
     this.#post({
       type: "init",
       bootstrap: this.#bootstrap.map((b) => b.href),
