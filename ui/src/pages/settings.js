@@ -19,7 +19,7 @@ const TABS = [
   { id: "oauth", label: "OAuth" },
   { id: "rateLimits", label: "Rate limits" },
   { id: "smtp", label: "Mail (SMTP)" },
-  { id: "s3", label: "Files storage (S3)" },
+  { id: "s3", label: "Files storage" },
   { id: "collections", label: "Collections" },
 ];
 
