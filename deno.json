@@ -1,6 +1,6 @@
 {
   "name": "@denobase/denobase",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "exports": {
     ".": "./mod.ts",
     "./testing": "./src/testing/mod.ts"
