@@ -50,6 +50,7 @@ export class Logs {
       data JSON DEFAULT '{}' NOT NULL, created TEXT DEFAULT '' NOT NULL, updated TEXT DEFAULT '' NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_logs_level ON _logs (level);
       CREATE INDEX IF NOT EXISTS idx_logs_message ON _logs (message);
+      CREATE INDEX IF NOT EXISTS idx_logs_created ON _logs (created);
       CREATE INDEX IF NOT EXISTS idx_logs_created_hour ON _logs (strftime('%Y-%m-%d %H:00:00', created));`);
   }
 
@@ -78,12 +79,14 @@ export class Logs {
   }
 
   /** PB search provider shape: {page, perPage, totalItems, totalPages, items}. */
-  list(q: { filter?: string; sort?: string; page?: number; perPage?: number }): Page<Log> {
+  list(q: { filter?: string; sort?: string; page?: number; perPage?: number; skipTotal?: boolean }): Page<Log> {
     const page = q.page && q.page > 0 ? q.page : 1;
     const perPage = Math.min(q.perPage && q.perPage > 0 ? q.perPage : 30, 1000);
     const pb = this.#compile(q.filter, q.sort);
-    const totalItems = sql.count(this.db, LOGS, undefined, pb);
     const items = sql.findMany(this.db, LOGS, { limit: perPage, offset: (page - 1) * perPage }, pb).map(toLog);
+    // PB's search provider answers -1 totals with skipTotal: the COUNT is a second full pass over the filter.
+    if (q.skipTotal) return { page, perPage, totalItems: -1, totalPages: -1, items };
+    const totalItems = sql.count(this.db, LOGS, undefined, pb);
     return { page, perPage, totalItems, totalPages: Math.ceil(totalItems / perPage), items };
   }
 
@@ -103,6 +106,39 @@ export class Logs {
     return rows.map((r) => ({ date: `${r.date}.000Z`, total: Number(r.total) }));
   }
 
+  /**
+   * Request traffic per hour since `since` in one pass over the created index (Denobase-only, for the dashboard):
+   * totals, errors (level>=8 or status>=400) and nearest-rank latency of the requests that carry execTime, so the
+   * client neither runs two stats calls nor pulls raw rows to compute percentiles.
+   */
+  traffic(since: Date): { hours: TrafficHour[]; overall: Latency } {
+    const rows = this.db.prepare(
+      `SELECT strftime('%Y-%m-%d %H:00:00', created) AS date,
+         (level >= 8 OR COALESCE(json_extract(data, '$.status'), 0) >= 400) AS err,
+         CAST(json_extract(data, '$.execTime') AS REAL) AS ms
+       FROM _logs WHERE created >= ?`,
+    ).all(stamp(since)) as { date: string; err: number; ms: number | null }[];
+    const byHour = new Map<string, { total: number; errors: number; ms: number[] }>();
+    const every: number[] = [];
+    for (const r of rows) {
+      let h = byHour.get(r.date);
+      if (!h) byHour.set(r.date, h = { total: 0, errors: 0, ms: [] });
+      h.total++;
+      if (r.err) h.errors++;
+      if (r.ms && r.ms > 0) {
+        h.ms.push(r.ms);
+        every.push(r.ms);
+      }
+    }
+    const hours = [...byHour.entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([date, h]) => ({
+      date: `${date}.000Z`,
+      total: h.total,
+      errors: h.errors,
+      ...latency(h.ms),
+    }));
+    return { hours, overall: latency(every) };
+  }
+
   truncate(): void {
     this.db.exec(`DELETE FROM _logs`);
     try {
@@ -114,6 +150,16 @@ export class Logs {
   async deleteOlderThan(date: Date): Promise<void> {
     await deleteInBatches(this.db, "_logs", "created <= ?", [stamp(date)]);
   }
+}
+
+/** Nearest-rank latency of a set of durations in ms; nulls when empty. */
+export type Latency = { avg: number | null; p90: number | null; p99: number | null };
+export type TrafficHour = { date: string; total: number; errors: number } & Latency;
+function latency(ms: number[]): Latency {
+  if (!ms.length) return { avg: null, p90: null, p99: null };
+  const v = ms.sort((a, b) => a - b);
+  const q = (p: number) => v[Math.min(v.length - 1, Math.ceil(p * v.length) - 1)];
+  return { avg: v.reduce((a, b) => a + b, 0) / v.length, p90: q(0.9), p99: q(0.99) };
 }
 
 function toLog(d: Record<string, unknown>): Log {
