@@ -15,7 +15,7 @@ deno add jsr:@denobase/denobase
 Import it under the bare key `denobase` (what `deno add` writes to your `deno.json`):
 
 ```json
-{ "imports": { "denobase": "jsr:@denobase/denobase@^0.2.2" } }
+{ "imports": { "denobase": "jsr:@denobase/denobase@^0.2.3" } }
 ```
 
 ## Usage
