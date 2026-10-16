@@ -101,29 +101,39 @@ export class Notifications {
     if (!before && after) await p.start?.(this.#events());
   }
 
-  /** Validates, logs as queued, then tries the provider up to maxAttempts; resolves with the final row. */
-  async send(input: NotificationMessage): Promise<NotificationRecord> {
+  /**
+   * Validates, logs as queued, then tries the provider up to maxAttempts (`opts.maxAttempts` overrides it for this
+   * send: a caller under a deadline that reports the failure itself asks for 1); resolves with the final row.
+   */
+  async send(input: NotificationMessage, opts: { maxAttempts?: number } = {}): Promise<NotificationRecord> {
     const parsed = messageSchema.safeParse(input);
     if (!parsed.success) throw badRequest(parsed.error.issues[0]?.message ?? "Invalid message.");
     const msg = parsed.data;
     const provider = this.get(msg.provider);
+    const email = provider.channels[0] === "email";
+    if (email && (!msg.subject?.trim() || msg.media)) {
+      throw badRequest("An e-mail needs a subject and takes no media.");
+    }
     const media = msg.media ? { ...msg.media, data: undefined } : null;
     const row = await this.store.collection(notifications).create({
       provider: provider.id,
       channel: provider.channels[0],
       to: msg.to,
-      text: msg.text ?? "",
+      // An e-mail logs its subject: the body is HTML (and may carry a private link), so it is not kept, like inline
+      // media; retry() therefore cannot resend one.
+      text: email ? msg.subject! : msg.text ?? "",
       media,
       status: "queued",
       attempts: 0,
     });
-    return await this.#attempt(row.id, provider, msg);
+    return await this.#attempt(row.id, provider, msg, 0, Math.max(1, opts.maxAttempts ?? this.#maxAttempts));
   }
 
   /** Sends a failed row again; media sent by url retries, base64 media was never logged and cannot. */
   async retry(id: string): Promise<NotificationRecord> {
     const row = await this.store.collection(notifications).get(id);
     if (row.status !== "failed") throw badRequest("Only failed notifications can be retried.");
+    if (row.channel === "email") throw badRequest("An e-mail's body is not kept; send it again.");
     const media = row.media as NotificationMessage["media"] | null;
     if (media && !media.url) throw badRequest("Media sent inline is not kept; send it again.");
     const msg: NotificationMessage = {
@@ -151,10 +161,16 @@ export class Notifications {
     for (const p of this.#providers.values()) await p.stop?.();
   }
 
-  async #attempt(id: string, p: Provider, msg: NotificationMessage, done = 0): Promise<NotificationRecord> {
+  async #attempt(
+    id: string,
+    p: Provider,
+    msg: NotificationMessage,
+    done = 0,
+    maxAttempts = this.#maxAttempts,
+  ): Promise<NotificationRecord> {
     const rows = this.store.collection(notifications);
     let error = "";
-    for (let n = 1; n <= this.#maxAttempts; n++) {
+    for (let n = 1; n <= maxAttempts; n++) {
       if (n > 1) await delay(this.#backoff(n - 1));
       try {
         const { externalId } = await traced("notification.send", {
@@ -170,7 +186,7 @@ export class Notifications {
         error = err instanceof Error ? err.message : String(err);
       }
     }
-    return await rows.update(id, { status: "failed", attempts: done + this.#maxAttempts, error: error.slice(0, 2000) });
+    return await rows.update(id, { status: "failed", attempts: done + maxAttempts, error: error.slice(0, 2000) });
   }
 
   async #configRow(id: string) {
