@@ -8,12 +8,13 @@ import {
   hidden,
   oauthFixture,
   REDIRECT,
+  RESOURCE,
   toConsent,
   txnCsrf,
 } from "./testkit.ts";
 import type { App } from "../app.ts";
 import { MemoryMailer } from "../auth/mailer.ts";
-import { mt_users } from "../mcp/testkit.ts";
+import { INITIALIZE, mt_users, rpc } from "../mcp/testkit.ts";
 
 /** A fresh request (auth_collection when given) and its login page. */
 async function open(b: Browser, clientId: string, extra: Record<string, string> = {}) {
@@ -189,4 +190,38 @@ Deno.test("oauth collection: a static client fixes its collection; another auth_
   const res = await b.post("/oauth/login", { txn, csrf, email: "su@x.io", password: "12345678" });
   assertEquals(res.status, 303);
   assert(b.cookie.includes("denobase_oauth="));
+});
+
+Deno.test("oauth collection: /api/mcp/_superusers signs a superuser in with no auth_collection, and only there", async () => {
+  const t = await oauthFixture();
+  const bound = `${RESOURCE}/_superusers`;
+  const meta = await t.app.fetch(
+    new Request("http://localhost/.well-known/oauth-protected-resource/api/mcp/_superusers"),
+  );
+  assertEquals((await meta.json()).resource, bound);
+  const unknown = await t.app.fetch(new Request("http://localhost/.well-known/oauth-protected-resource/api/mcp/nope"));
+  assertEquals(unknown.status, 404);
+  const challenge = await rpc(t.app, INITIALIZE, {}, "POST", "/api/mcp/_superusers");
+  assertStringIncludes(challenge.headers.get("WWW-Authenticate")!, "oauth-protected-resource/api/mcp/_superusers");
+
+  const { b, res } = await login(t.app, t.clientId, { resource: bound }, { email: "su@x.io", password: "12345678" });
+  assertEquals(res.status, 303);
+  const consent = await (await b.get(res.headers.get("location")!)).text();
+  const u = await delivered(
+    await b.post("/oauth/consent", { txn: hidden(consent, "txn"), csrf: hidden(consent, "csrf"), action: "allow" }),
+  );
+  const tk = await exchange(t.app, t.clientId, u.searchParams.get("code")!, { resource: bound });
+  assertEquals(tk.status, 200, JSON.stringify(tk.body));
+  const auth = { Authorization: `Bearer ${tk.body.access_token}` };
+  assertEquals((await rpc(t.app, INITIALIZE, auth, "POST", "/api/mcp/_superusers")).status, 200);
+  assertEquals((await rpc(t.app, INITIALIZE, auth)).status, 401);
+
+  // The bound resource's collection is the only one: a user's account cannot sign in there, nor ask for another.
+  const user = await login(t.app, t.clientId, { resource: bound }, { email: "ana@x.io", password: "12345678" });
+  assertEquals(user.res.status, 400);
+  const other = await new Browser(t.app).get(
+    authorizeQuery(t.clientId, { resource: bound, auth_collection: "mt_users" }),
+  );
+  assertEquals(other.status, 303);
+  assertEquals(new URL(other.headers.get("location")!).searchParams.get("error"), "invalid_request");
 });

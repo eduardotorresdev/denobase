@@ -1,6 +1,6 @@
 import type { Context, Hono } from "hono";
 import type { AppEnv, Ctx } from "../http/app.ts";
-import { MCP_PATH, mcpResource } from "../mcp/host.ts";
+import { MCP_PATH, mcpPath, mcpResource } from "../mcp/host.ts";
 import type { OAuthCtx } from "./context.ts";
 
 /** RFC 9728 protected resource metadata; also served with the resource path appended (as clients probe first). */
@@ -17,12 +17,21 @@ export function baseOf(c: Context<AppEnv>, ctx: Ctx): string {
 /** Whether this app answers as an authorization server right now (code and settings both on). */
 export const asActive = (o: OAuthCtx | null): o is OAuthCtx => !!o?.enabled;
 
-/** The resource metadata: authorization_servers names this same origin when the embedded server is on. */
+/** Whether /api/mcp/<collection> is served: an auth collection the embedded server may sign in against. */
+export const boundCollection = (o: OAuthCtx | null, slug: string): boolean =>
+  asActive(o) && o.collections().some((col) => col.slug === slug);
+
+/**
+ * The resource metadata: authorization_servers names this same origin when the embedded server is on. Also served
+ * for each collection-bound resource (/api/mcp/<collection>), whose metadata names that resource.
+ */
 export function protectedResourceRoutes(app: Hono<AppEnv>, ctx: Ctx, o: OAuthCtx | null): void {
   const handler = (c: Context<AppEnv>) => {
     const base = baseOf(c, ctx);
+    const collection = c.req.param("collection") ?? "";
+    if (collection && !boundCollection(o, collection)) return c.json({ error: "not_found" }, 404);
     return c.json({
-      resource: mcpResource(base),
+      resource: mcpResource(base, collection),
       authorization_servers: asActive(o) ? [base] : [],
       ...(asActive(o) ? { scopes_supported: [...o.scopes.keys()] } : {}),
       bearer_methods_supported: ["header"],
@@ -31,6 +40,7 @@ export function protectedResourceRoutes(app: Hono<AppEnv>, ctx: Ctx, o: OAuthCtx
   };
   app.get(METADATA_PATH, handler);
   app.get(`${METADATA_PATH}${MCP_PATH}`, handler);
+  app.get(`${METADATA_PATH}${mcpPath(":collection")}`, handler);
 }
 
 /** RFC 8414 authorization server metadata (and the same body at the OIDC discovery path, no id_token). */

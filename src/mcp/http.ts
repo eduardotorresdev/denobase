@@ -1,10 +1,10 @@
 import type { Context, Hono } from "hono";
 import { type AppEnv, type Ctx, tokenFromHeader } from "../http/app.ts";
 import { tokenClaims } from "../auth/jwt.ts";
-import { MCP_PATH, mcpResource } from "./host.ts";
+import { MCP_PATH, mcpPath, mcpResource } from "./host.ts";
 import type { McpHost } from "./host.ts";
 import type { OAuthCtx } from "../oauth/context.ts";
-import { METADATA_PATH, protectedResourceRoutes } from "../oauth/metadata.ts";
+import { boundCollection, METADATA_PATH, protectedResourceRoutes } from "../oauth/metadata.ts";
 import { grantActive } from "../oauth/tables.ts";
 import { splitScope, toolAllowed } from "../oauth/scopes.ts";
 const LOCAL = new Set(["localhost", "127.0.0.1", "[::1]"]);
@@ -24,14 +24,19 @@ export function mcpRoutes(app: Hono<AppEnv>, ctx: Ctx, oauth: OAuthCtx | null = 
 
   protectedResourceRoutes(app, ctx, oauth);
 
-  app.all(MCP_PATH, async (c) => {
+  // /api/mcp/<collection> is the same server for a client that signs in against that collection (a superuser).
+  const handler = async (c: Context<AppEnv>) => {
+    const collection = c.req.param("collection") ?? "";
+    if (collection && !boundCollection(oauth, collection)) return c.json({ error: "not_found" }, 404);
+    const resource = mcpResource(base(c), collection);
+    const metadata = `${base(c)}${METADATA_PATH}${collection ? mcpPath(collection) : ""}`;
     if (!originAllowed(c, ctx, host.options.allowedOrigins)) {
       return c.json({ jsonrpc: "2.0", id: null, error: { code: -32000, message: "Origin not allowed." } }, 403);
     }
     const user = c.get("user");
     const token = tokenFromHeader(c.req.header("Authorization"));
     // Every method, not only POST: a GET stream the SDK may serve one day opens behind the same checks.
-    const challenge = `Bearer resource_metadata="${base(c)}${METADATA_PATH}"`;
+    const challenge = `Bearer resource_metadata="${metadata}"`;
     const refuse = (message: string) => {
       c.header("WWW-Authenticate", `${challenge}, error="invalid_token"`);
       return c.json({ jsonrpc: "2.0", id: null, error: { code: -32001, message } }, 401);
@@ -43,7 +48,7 @@ export function mcpRoutes(app: Hono<AppEnv>, ctx: Ctx, oauth: OAuthCtx | null = 
       return c.json({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "Authentication required." } }, 401);
     }
     const claims = tokenClaims(token ?? "");
-    if (user && host.options.requireAudience && claims.aud !== mcpResource(base(c))) {
+    if (user && host.options.requireAudience && claims.aud !== resource) {
       return refuse("Token not issued for this MCP server.");
     }
     if (user && claims.gid && !grantActive(ctx.db, claims.gid)) return refuse("The authorization was revoked.");
@@ -54,7 +59,7 @@ export function mcpRoutes(app: Hono<AppEnv>, ctx: Ctx, oauth: OAuthCtx | null = 
       if (missing) {
         c.header(
           "WWW-Authenticate",
-          `Bearer error="insufficient_scope", scope="${missing}", resource_metadata="${base(c)}${METADATA_PATH}"`,
+          `Bearer error="insufficient_scope", scope="${missing}", resource_metadata="${metadata}"`,
         );
         return c.json(
           { jsonrpc: "2.0", id: null, error: { code: -32001, message: "The token's scope does not allow this tool." } },
@@ -70,7 +75,9 @@ export function mcpRoutes(app: Hono<AppEnv>, ctx: Ctx, oauth: OAuthCtx | null = 
         extra: { user, scopes },
       },
     });
-  });
+  };
+  app.all(MCP_PATH, handler);
+  app.all(mcpPath(":collection"), handler);
 }
 
 /**
@@ -97,9 +104,9 @@ async function outOfScope(c: Context<AppEnv>, host: McpHost, scopes: string[]): 
   return null;
 }
 
-/** A token with an `aud` (an MCP token) authenticates only on /api/mcp; one without it, anywhere (PB's tokens). */
+/** A token with an `aud` (an MCP token) authenticates only on /api/mcp[/<collection>]; one without it, anywhere. */
 export function audienceAllows(token: string, path: string): boolean {
-  return tokenClaims(token).aud === undefined || path === MCP_PATH;
+  return tokenClaims(token).aud === undefined || path === MCP_PATH || path.startsWith(`${MCP_PATH}/`);
 }
 
 /** DNS-rebinding guard: no Origin (non-browser clients) passes; a browser must be local, same-origin or listed. */

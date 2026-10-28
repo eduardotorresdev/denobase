@@ -34,10 +34,10 @@ with `createCli()`, adding or replacing commands with `cli.add`.
   server-rendered pages (own httpOnly cookie, no SPA), and the client gets the app's auth JWT (`aud` =
   `<appURL>/api/mcp`, claims `scope`/`cid`/`gid`) plus a rotating refresh token. Who may authorize is
   `McpOptions.oauth.collections` (default `["_superusers"]`), narrowed by `settings.oauth`; which one a request signs in
-  against is picked by whoever launches it (`auth_collection`, else `settings.oauth.defaultCollection`), and the login
-  page stays opaque about it (no selector, one generic failure). Scopes (`mcp`, `mcp:read`, `mcp:write`, app scopes)
-  only narrow the tools; access rules still decide. Revocation is immediate (`gid` is checked per request).
-  `app.mcp.token` stays the manual path for CI and scripts.
+  against is picked by whoever launches it (`auth_collection`, or the server URL `/api/mcp/<collection>`, else
+  `settings.oauth.defaultCollection`), and the login page stays opaque about it (no selector, one generic failure).
+  Scopes (`mcp`, `mcp:read`, `mcp:write`, app scopes) only narrow the tools; access rules still decide. Revocation is
+  immediate (`gid` is checked per request). `app.mcp.token` stays the manual path for CI and scripts.
 - Tracing is native (`src/telemetry/`): `app.tracer.span(name, attrs, fn)` for consumer work; requests, cron runs, SQL,
   tx, hooks, CRUD, batch, realtime, mail, notifications and `app.tracer.fetch` are traced on their own. Spans go to
   `_spans` in the auxiliary db; read them in tests with `collectSpans(app)`.

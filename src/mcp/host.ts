@@ -176,8 +176,16 @@ export class McpHost implements Mcp {
 }
 
 /** The RFC 8707 resource id of this server: <base>/api/mcp (base without a trailing slash). */
-export function mcpResource(base: string): string {
-  return `${base.replace(/\/+$/, "")}${MCP_PATH}`;
+export function mcpResource(base: string, collection = ""): string {
+  return `${base.replace(/\/+$/, "")}${mcpPath(collection)}`;
+}
+
+/**
+ * /api/mcp, or /api/mcp/<collection> for a client that must sign in against that auth collection (a superuser's
+ * admin tools): a path, not a query, since clients check that the resource metadata names the URL they were given.
+ */
+export function mcpPath(collection = ""): string {
+  return collection ? `${MCP_PATH}/${collection}` : MCP_PATH;
 }
 
 function zTraces() {
