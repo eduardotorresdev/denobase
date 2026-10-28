@@ -47,7 +47,13 @@ export class OAuthCtx {
   }
 
   resources(c: Context<AppEnv>): string[] {
-    return [this.resource(c), ...this.opts.extraResources];
+    const bound = this.collections().map((col) => mcpResource(this.issuer(c), col.slug));
+    return [this.resource(c), ...bound, ...this.opts.extraResources];
+  }
+
+  /** The auth collection a collection-bound resource (<base>/api/mcp/<collection>) signs in against; "" otherwise. */
+  resourceCollection(c: Context<AppEnv>, resource: string): string {
+    return this.collections().find((col) => mcpResource(this.issuer(c), col.slug) === resource)?.slug ?? "";
   }
 
   /** The code's collections narrowed by settings.oauth.allowedCollections; only real auth collections. */

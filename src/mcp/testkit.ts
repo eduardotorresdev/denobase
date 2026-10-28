@@ -98,9 +98,10 @@ export function rpc(
   body: unknown,
   headers: Record<string, string> = {},
   method = "POST",
+  path = "/api/mcp",
 ): Promise<Response> {
   return Promise.resolve(app.fetch(
-    new Request("http://localhost/api/mcp", {
+    new Request(`http://localhost${path}`, {
       method,
       headers: {
         "content-type": "application/json",

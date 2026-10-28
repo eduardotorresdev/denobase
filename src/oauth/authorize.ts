@@ -136,7 +136,12 @@ export function authorizeRoutes(app: Hono<AppEnv>, f: Flow): void {
     if (fixed && q.auth_collection && q.auth_collection !== fixed) {
       return backError("invalid_request", "auth_collection does not match this client.");
     }
-    const col = o.authCollection(fixed || q.auth_collection);
+    // A collection-bound resource (/api/mcp/<collection>) carries its collection; nothing may ask for another.
+    const bound = o.resourceCollection(c, resource);
+    if (bound && ((fixed && fixed !== bound) || (q.auth_collection && q.auth_collection !== bound))) {
+      return backError("invalid_request", "auth_collection does not match this resource.");
+    }
+    const col = o.authCollection(bound || fixed || q.auth_collection);
     if (!col) return backError("invalid_request", "auth_collection may not authorize.");
     const now = Date.now();
     const row: OAuthRequest = {
