@@ -40,8 +40,9 @@ export function activityLogger(ctx: Ctx): MiddlewareHandler<AppEnv> {
     const level = failed ? LEVEL.error : LEVEL.info;
     if (level < cfg.minLevel) return;
     const u = new URL(c.req.url);
-    // /oauth/* carries state, challenges and client ids in the query: masked like the traces' url.query.
-    const search = u.pathname.startsWith("/oauth/") && u.search ? `?${redactQuery(u.search) ?? ""}` : u.search;
+    // Any query may carry a credential (OAuth's state and challenges, a webhook's hub.verify_token): masked like the
+    // traces' url.query, the rest kept.
+    const search = u.search ? `?${redactQuery(u.search) ?? ""}` : "";
     // A path that carries a credential (app.redactPath) is stored with that segment masked.
     const url = cut(ctx.redactor.redact(u.pathname) + search, 3000);
     const method = cut(c.req.method.toUpperCase(), 50);

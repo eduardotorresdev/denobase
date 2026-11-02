@@ -22,7 +22,7 @@ export function isTraced(path: string): boolean {
 }
 
 /** Query keys whose values never reach a span: credentials, OAuth2 codes, and filters (they quote user data). */
-const SENSITIVE = /token|code|state|pass|secret|key|auth|sig|session|otp|filter|email|txn/i;
+const SENSITIVE = /token|code|state|pass|secret|key|auth|sig|session|otp|filter|email|txn|challenge/i;
 
 /** url.query with every sensitive value masked and the rest kept, cut at 2000 chars. */
 export function redactQuery(search: string): string | undefined {

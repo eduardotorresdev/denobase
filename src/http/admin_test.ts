@@ -115,6 +115,18 @@ Deno.test("logs: every request is logged, errors at level 8, with PB's list/filt
   assertEquals((await t.call("GET", "/api/logs")).json.totalItems, 0);
 });
 
+Deno.test("logs: a credential in any query string is masked, the rest kept (a webhook's hub.verify_token)", async () => {
+  const t = await setup();
+  await t.call("GET", "/api/webhook/meta?hub.mode=subscribe&hub.verify_token=segredo123&hub.challenge=987654");
+  const { items } = (await t.call("GET", "/api/logs?sort=-created")).json;
+  const log = items.find((l: { data: { url?: string } }) => l.data.url?.startsWith("/api/webhook/meta"));
+  assertEquals(
+    log.data.url,
+    "/api/webhook/meta?hub.mode=subscribe&hub.verify_token=%5Bredacted%5D&hub.challenge=%5Bredacted%5D",
+  );
+  assert(!JSON.stringify(log).includes("segredo123") && !JSON.stringify(log).includes("987654"));
+});
+
 Deno.test("logs list: skipTotal answers -1 totals and fields picks item keys, like PB", async () => {
   const t = await setup();
   await t.call("GET", "/api/health");
