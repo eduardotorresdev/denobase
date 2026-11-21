@@ -55,6 +55,57 @@ export async function archive(
   }
 }
 
+/** Compressed bytes per Inflate push: deflate expands at most ~1032x, so one push yields at most ~8 MiB. */
+const PUSH = 8 * 1024;
+
+/**
+ * Writes one entry, refusing it as soon as it inflates past its declared size (a zip bomb, or a damaged entry, never
+ * fills the disk or the memory); the partial file is removed on any failure.
+ */
+async function writeEntry(f: Deno.FsFile, e: Entry, start: number, path: string, dictionary?: Uint8Array) {
+  const out = await Deno.open(path, { write: true, createNew: true });
+  try {
+    let written = 0, crc = 0;
+    let ready: Uint8Array[] = [];
+    const sink = (chunk: Uint8Array) => {
+      crc = crc32(crc, chunk);
+      written += chunk.byteLength;
+      ready.push(chunk);
+    };
+    const inflate = e.method === 8 ? new Inflate({ dictionary }, (chunk) => sink(chunk)) : null;
+    const flush = async () => {
+      if (written > e.size) throw new Error(`backup entry is larger than it declares: ${e.name}`);
+      const chunks = ready;
+      ready = [];
+      for (const c of chunks) for (let off = 0; off < c.byteLength;) off += await out.write(c.subarray(off));
+    };
+    await f.seek(start, Deno.SeekMode.Start);
+    const buf = new Uint8Array(1 << 20);
+    // At least one pass, so an empty deflated entry still gets its final (empty) block.
+    let left = e.compressed;
+    do {
+      const n = left ? await f.read(buf.subarray(0, Math.min(buf.length, left))) : 0;
+      if (n === null) throw new Error(`backup zip is truncated: ${e.name}`);
+      left -= n;
+      let p = 0;
+      do {
+        const end = Math.min(n, p + PUSH);
+        const chunk = buf.slice(p, end);
+        if (inflate) inflate.push(chunk, left === 0 && end === n);
+        else sink(chunk);
+        await flush();
+        p = end;
+      } while (p < n);
+    } while (left > 0);
+    if (written !== e.size || crc !== e.crc) throw new Error(`backup entry is damaged: ${e.name}`);
+    out.close();
+  } catch (err) {
+    out.close();
+    await Deno.remove(path).catch(() => {});
+    throw err;
+  }
+}
+
 /** A zip entry name that stays inside the extraction dir. */
 function safeEntry(name: string): boolean {
   return !name.startsWith("/") && !name.includes("\\") && !name.split("/").some((p) => p === ".." || p === "");
@@ -172,37 +223,13 @@ export async function extract(zipPath: string, dir: string): Promise<void> {
       const start = e.offset + 30 + lh.getUint16(26, true) + lh.getUint16(28, true);
       const path = `${dir}/${e.name}`;
       await Deno.mkdir(path.slice(0, path.lastIndexOf("/")), { recursive: true });
-      const out = await Deno.open(path, { write: true, createNew: true });
       try {
-        let written = 0, crc = 0;
-        let ready: Uint8Array[] = [];
-        const sink = (chunk: Uint8Array) => {
-          crc = crc32(crc, chunk);
-          written += chunk.byteLength;
-          ready.push(chunk);
-        };
-        const inflate = e.method === 8 ? new Inflate((chunk) => sink(chunk)) : null;
-        const flush = async () => {
-          const chunks = ready;
-          ready = [];
-          for (const c of chunks) for (let off = 0; off < c.byteLength;) off += await out.write(c.subarray(off));
-        };
-        await f.seek(start, Deno.SeekMode.Start);
-        const buf = new Uint8Array(1 << 20);
-        // At least one pass, so an empty deflated entry still gets its final (empty) block.
-        let left = e.compressed;
-        do {
-          const n = left ? await f.read(buf.subarray(0, Math.min(buf.length, left))) : 0;
-          if (n === null) throw new Error(`backup zip is truncated: ${e.name}`);
-          left -= n;
-          const chunk = buf.slice(0, n);
-          if (inflate) inflate.push(chunk, left === 0);
-          else sink(chunk);
-          await flush();
-        } while (left > 0);
-        if (written !== e.size || crc !== e.crc) throw new Error(`backup entry is damaged: ${e.name}`);
-      } finally {
-        out.close();
+        await writeEntry(f, e, start, path);
+      } catch (err) {
+        // 0.3.0 wrote some entries whose deflate references bytes before its start, which its encoder's window held
+        // as zeros: inflated against a 32 KiB zero dictionary they come back whole, and size and CRC prove it.
+        if (e.method !== 8 || !String((err as Error)?.message).includes("invalid distance")) throw err;
+        await writeEntry(f, e, start, path, new Uint8Array(32 * 1024));
       }
     }
   } finally {

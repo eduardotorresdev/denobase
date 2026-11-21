@@ -86,6 +86,29 @@ function worker(e: Env, id: string, ...flags: string[]): Deno.ChildProcess {
   return p;
 }
 
+/**
+ * A backup through the queue, within a deadline: on timeout the error carries the unfinished jobs, so a hang says
+ * where it stopped (a run left waiting on the serve's heavy executor would otherwise wait forever).
+ */
+async function backedUp(e: Env, key: string, ms = 90_000): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      createBackup(e.app.queue, key),
+      new Promise<never>((_, rej) =>
+        timer = setTimeout(() => {
+          const rows = e.app.db.prepare(
+            `SELECT name, status, worker, attempts, error, history FROM _jobs WHERE status IN ('pending', 'running')`,
+          ).all();
+          rej(new Error(`timed out: backup ${key}; unfinished jobs: ${JSON.stringify(rows)}`));
+        }, ms)
+      ),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** A process's exit, within a deadline: a test never waits on a process forever. */
 async function exited(p: Deno.ChildProcess, what: string, ms = 60_000): Promise<Deno.CommandStatus> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -99,8 +122,11 @@ async function exited(p: Deno.ChildProcess, what: string, ms = 60_000): Promise<
   }
 }
 
+/** Waits stretch this much: under a loaded machine (CI, three suites at once) a spawn alone can take seconds. */
+const SLACK = 3;
+
 async function until(what: string, ok: () => boolean, ms = 20_000): Promise<void> {
-  const end = Date.now() + ms;
+  const end = Date.now() + ms * SLACK;
   while (!ok()) {
     if (Date.now() > end) throw new Error(`timed out: ${what}`);
     await new Promise((r) => setTimeout(r, 50));
@@ -647,7 +673,7 @@ Deno.test(
       await until("w1 up", live(e, "w1"));
       const before = await e.app.queue.enqueue("t_sleep", { ms: 1 });
       await until("before ran", () => status(e, before.id) === "done");
-      await createBackup(e.app.queue, "b.zip");
+      await backedUp(e, "b.zip");
       const after = await e.app.queue.enqueue("t_sleep", { ms: 1 });
       await until("after ran", () => status(e, after.id) === "done");
       const inode = fileId(`${e.dir}/data.db`);
@@ -796,7 +822,7 @@ for (const serves of [1, 2]) {
         e.app.db.exec(`CREATE TABLE t_big (b BLOB)`);
         e.app.db.exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 40)
           INSERT INTO t_big SELECT randomblob(1048576) FROM n`);
-        await createBackup(e.app.queue, "b.zip");
+        await backedUp(e, "b.zip");
         const inode = fileId(`${e.dir}/data.db`);
         Deno.writeTextFileSync(`${e.dir}/.t_restore`, "b.zip");
         // The restorer exits non-zero (1: PB's restart after a restore); every other serve leaves with 75; both are
