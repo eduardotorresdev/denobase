@@ -84,3 +84,51 @@ Deno.test("a truncated or damaged backup zip is refused, never half restored", a
     await Deno.remove(dir, { recursive: true });
   }
 });
+
+Deno.test("a very compressible entry restores with bounded memory; one inflating past its declared size is refused early", async () => {
+  const dir = await Deno.makeTempDir();
+  try {
+    const size = 256 * 1024 * 1024; // zeros: what a db full of free pages looks like to deflate
+    const f = await Deno.open(`${dir}/zeros`, { write: true, create: true });
+    await f.truncate(size);
+    f.close();
+    await Deno.writeFile(`${dir}/z.zip`, zipStream([["data.db", `${dir}/zeros`]], { bytes: 0 }));
+    const base = Deno.memoryUsage().rss;
+    let peak = base;
+    const probe = setInterval(() => (peak = Math.max(peak, Deno.memoryUsage().rss)), 5);
+    try {
+      await extract(`${dir}/z.zip`, `${dir}/o1`);
+    } finally {
+      clearInterval(probe);
+    }
+    assertEquals((await Deno.stat(`${dir}/o1/data.db`)).size, size);
+    assert(peak - base < 96 * 1024 * 1024, `peak grew ${Math.round((peak - base) / 2 ** 20)} MiB`);
+
+    // The same entry claiming 10 bytes in the central directory: refused before it writes more than a push's worth.
+    const zip = await Deno.readFile(`${dir}/z.zip`);
+    const cd = zip.lastIndexOf(0x50, zip.length - 22 - 3);
+    let at = -1;
+    for (let i = cd; i >= 0; i--) {
+      if (zip[i] === 0x50 && zip[i + 1] === 0x4b && zip[i + 2] === 0x01 && zip[i + 3] === 0x02) {
+        at = i;
+        break;
+      }
+    }
+    new DataView(zip.buffer).setUint32(at + 24, 10, true);
+    await Deno.writeFile(`${dir}/bomb.zip`, zip);
+    await assertRejects(() => extract(`${dir}/bomb.zip`, `${dir}/o2`), Error, "larger than it declares");
+    await assertRejects(() => Deno.stat(`${dir}/o2/data.db`), Deno.errors.NotFound);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("a 0.3.0 backup whose deflate references bytes before its start restores (zero dictionary, CRC checked)", async () => {
+  const out = await Deno.makeTempDir();
+  try {
+    await extract(new URL("./testdata/old_writer_0_3_0.zip", import.meta.url).pathname, out);
+    assertEquals((await Deno.stat(`${out}/data.db`)).size, 4096);
+  } finally {
+    await Deno.remove(out, { recursive: true });
+  }
+});

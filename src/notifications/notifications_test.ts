@@ -400,3 +400,17 @@ Deno.test("send: a serve frozen past its hold writes neither a renewal nor its o
   const now = await rows.get(row!.id) as unknown as { status: string; sender: string; sendUntil: number };
   assertEquals([now.status, now.sender, now.sendUntil], ["queued", "other", until]);
 });
+
+Deno.test("send: a retry after the hold was taken by another serve is not sent", async () => {
+  const t = await setup({ failures: 1 });
+  const rows = t.app.store.collection(notifications);
+  const real = t.fake.send.bind(t.fake);
+  // The first attempt fails; while it does, another serve takes the reservation.
+  t.fake.send = async (m) => {
+    const r = await rows.query().first() as { id: string };
+    await rows.update(r.id, { sender: "other", sendUntil: Date.now() + 60_000 } as never);
+    return real(m);
+  };
+  await t.n.send({ provider: "fake", to: "1", text: "x" });
+  assertEquals(t.fake.sent.length, 0);
+});

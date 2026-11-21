@@ -225,6 +225,9 @@ export class Notifications {
       let error = "";
       for (let n = 1; n <= maxAttempts; n++) {
         if (n > 1) await delay(this.#backoff(n - 1));
+        // A hold lost while frozen (or in the backoff): the serve that took it sends; this one must not send again.
+        const cur = await this.store.collection(notifications).get(row.id).catch(() => null);
+        if (!cur || cur.sender !== this.#token) return (cur ?? row) as NotificationRecord;
         let externalId: string | undefined;
         try {
           ({ externalId } = await traced("notification.send", {
