@@ -71,10 +71,13 @@ Deno.test("attention: a failed sign-in burst and a failed cron run are listed wi
     });
     assertEquals(r.status, 400);
   }
-  t.app.cron.add("broken", "0 0 1 1 *", () => {
-    throw new Error("boom");
-  });
-  await t.app.cron.get("broken")!.run("manual").catch(() => {});
+  let fail = true;
+  t.app.queue.define("broken", () => {
+    if (fail) throw new Error("boom");
+  }, { maxAttempts: 1 });
+  t.app.queue.schedule("broken", "0 0 1 1 *", "broken");
+  await t.app.queue.runNow("broken");
+  await t.app.queue.drain();
   t.app.tracer.flush();
   const list = async () =>
     own((await t.get(t.suToken, "/api/_denobase/attention")).json.items) as {
@@ -88,8 +91,9 @@ Deno.test("attention: a failed sign-in burst and a failed cron run are listed wi
   assertEquals(broken.severity, "error");
   assert(broken.href.startsWith("#/traces/"));
   // A good run afterwards does not hide the day's failure: it turns into a warning.
-  t.app.cron.add("broken", "0 0 1 1 *", () => {});
-  await t.app.cron.get("broken")!.run("manual");
+  fail = false;
+  await t.app.queue.runNow("broken");
+  await t.app.queue.drain();
   t.app.tracer.flush();
   const after = (await list()).find((i) => i.id === "cron:broken")!;
   assertEquals([after.severity, after.href], ["warning", broken.href]);
@@ -107,8 +111,10 @@ Deno.test("traffic: the last-hour window slides by the minute instead of resetti
 
 Deno.test("jobs: crons with their last run, and no backup storage without a data dir", async () => {
   const t = await setup();
-  t.app.cron.add("nightly", "0 3 * * *", () => {});
-  await t.app.cron.get("nightly")!.run("manual");
+  t.app.queue.define("nightly", () => {});
+  t.app.queue.schedule("nightly", "0 3 * * *", "nightly");
+  await t.app.queue.runNow("nightly");
+  await t.app.queue.drain();
   t.app.tracer.flush();
   const r = (await t.get(t.suToken, "/api/_denobase/jobs")).json;
   const nightly = r.crons.find((j: { id: string }) => j.id === "nightly");

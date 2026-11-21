@@ -1,4 +1,3 @@
-/** PB tools/cron: the schedule grammar, the job runner and PB's own maintenance jobs. */
+/** PB tools/cron: the schedule grammar and PB's own maintenance jobs (scheduled on the queue, see src/queue/). */
 export { Schedule } from "./schedule.ts";
-export { Cron, type CronTrigger, type Job } from "./cron.ts";
 export { systemJobs } from "./system.ts";

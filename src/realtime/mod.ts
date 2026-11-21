@@ -38,10 +38,19 @@ export interface Client {
 /** Who of the subscribed clients receives a published message; req is the client's, with its own access. */
 export type TopicAccess = (args: { auth: AuthUser | null; req: Req }) => boolean | Promise<boolean>;
 
+/** Named access, the only kind that crosses processes (a job's publish reaches the serves through the outbox). */
+export type NamedTopicAccess = "authenticated" | "superusers" | "everyone";
+
 export interface PublishOptions {
   /** Defaults to any authenticated client: a custom topic carries domain data, so guests opt in explicitly. */
-  access?: TopicAccess;
+  access?: TopicAccess | NamedTopicAccess;
 }
+
+const NAMED: Record<NamedTopicAccess, TopicAccess> = {
+  authenticated: ({ auth }) => auth !== null,
+  superusers: ({ auth }) => auth?.collection === "_superusers",
+  everyone: () => true,
+};
 
 /**
  * PB OnRealtimeSubscribeRequest: runs before the subscriptions replace the client's; throwing (an ApiError) refuses
@@ -233,6 +242,18 @@ export class Realtime {
    */
   publish(topic: string, data: unknown, opts: PublishOptions = {}): Promise<number> {
     if (!topic) return Promise.reject(new Error("realtime.publish: empty topic"));
+    if (this.#forward) {
+      // An executor has no clients: the message goes to the serves, which deliver it (§7).
+      const access = opts.access ?? "authenticated";
+      if (typeof access === "function") {
+        return Promise.reject(
+          new Error("realtime.publish from a job: access must be 'authenticated', 'superusers' or 'everyone'"),
+        );
+      }
+      const fwd = this.#forward;
+      afterCommit(this.db, () => fwd(topic, data ?? null, access));
+      return Promise.resolve(0);
+    }
     return traced("realtime.publish", {
       kind: SpanKind.producer,
       attributes: { "messaging.system": "denobase.realtime", "messaging.destination.name": topic },
@@ -243,9 +264,17 @@ export class Realtime {
     });
   }
 
+  #forward?: (topic: string, data: unknown, access: NamedTopicAccess) => void;
+
+  /** Sends every publish elsewhere instead of to clients (executors, to the outbox). */
+  forward(fn: (topic: string, data: unknown, access: NamedTopicAccess) => void): void {
+    this.#forward = fn;
+  }
+
   async #publish(topic: string, data: unknown, opts: PublishOptions): Promise<number> {
     const payload = JSON.stringify(data ?? null);
-    const access = opts.access ?? authenticated;
+    const a = opts.access ?? authenticated;
+    const access = typeof a === "string" ? NAMED[a] ?? NAMED.authenticated : a;
     const targets: Client[] = [];
     for (const c of this.clients.values()) {
       if (!c.subscriptions.has(topic)) continue;

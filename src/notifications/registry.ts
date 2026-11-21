@@ -1,7 +1,9 @@
+import { currentCall } from "../services/manager.ts";
 import { traced } from "../telemetry/instrument/child.ts";
 import { SpanKind } from "../telemetry/span.ts";
 import { badRequest, notFound } from "../core/errors.ts";
 import type { Store } from "../store/mod.ts";
+import { tx } from "../core/db.ts";
 import {
   notificationProvidersCollection as notificationProviders,
   notificationsCollection as notifications,
@@ -115,7 +117,12 @@ export class Notifications {
       throw badRequest("An e-mail needs a subject and takes no media.");
     }
     const media = msg.media ? { ...msg.media, data: undefined } : null;
-    const row = await this.store.collection(notifications).create({
+    // Called as a service from a job: the call's key. A retried job gets the row of its first send back, sent again
+    // only when that one failed or was left queued by a serve that died before sending (the effect never happened).
+    const idem = currentCall()?.idem ?? "";
+    const max = Math.max(1, opts.maxAttempts ?? this.#maxAttempts);
+    const fresh = {
+      idem,
       provider: provider.id,
       channel: provider.channels[0],
       to: msg.to,
@@ -123,11 +130,41 @@ export class Notifications {
       // media; retry() therefore cannot resend one.
       text: email ? msg.subject! : msg.text ?? "",
       media,
-      status: "queued",
+      status: "queued" as const,
       attempts: 0,
-    });
-    return await this.#attempt(row.id, provider, msg, 0, Math.max(1, opts.maxAttempts ?? this.#maxAttempts));
+    };
+    for (;;) {
+      const r = await this.#reserve(idem, fresh);
+      if ("done" in r) return r.done;
+      if ("mine" in r) return await this.#attempt(r.mine, provider, msg, max);
+      // Another process (or this one) is sending the same call: its outcome is this one's.
+      await delay(SEND_POLL_MS);
+    }
   }
+
+  /**
+   * Takes the call's row for sending, in one IMMEDIATE transaction (two serves never both take it): a sent row is the
+   * answer; a row someone holds under a live reservation is waited for; a failed row, a queued one nobody holds, or a
+   * reservation that lapsed (its serve died) is taken. Without a call key, a new row is created and taken.
+   */
+  #reserve(
+    idem: string,
+    fresh: { provider: string; channel: string; to: string; status: "queued" } & Record<string, unknown>,
+  ): Promise<{ done: NotificationRecord } | { mine: NotificationRecord } | { wait: true }> {
+    const rows = this.store.collection(notifications);
+    return tx(this.store.db, async () => {
+      const now = Date.now();
+      const hold = { status: "queued" as const, sender: this.#token, sendUntil: now + SEND_LEASE_MS };
+      const prior = idem ? await rows.query().where("idem", "equals", idem).first() : undefined;
+      if (!prior) return { mine: (await rows.create({ ...fresh, ...hold })) as NotificationRecord };
+      if (prior.status !== "failed" && prior.status !== "queued") return { done: prior as NotificationRecord };
+      if (prior.status === "queued" && prior.sender && Number(prior.sendUntil) > now) return { wait: true as const };
+      return { mine: (await rows.update(prior.id, hold)) as NotificationRecord };
+    });
+  }
+
+  /** This process's reservation token. */
+  readonly #token = crypto.randomUUID().slice(0, 18);
 
   /** Sends a failed row again; media sent by url retries, base64 media was never logged and cannot. */
   async retry(id: string): Promise<NotificationRecord> {
@@ -142,7 +179,16 @@ export class Notifications {
       text: row.text || undefined,
       media: media ?? undefined,
     };
-    return await this.#attempt(row.id, this.get(row.provider), msg, row.attempts ?? 0);
+    const mine = await tx(this.store.db, async () => {
+      const r = await this.store.collection(notifications).get(id);
+      if (r.status !== "failed") throw badRequest("Only failed notifications can be retried.");
+      return await this.store.collection(notifications).update(id, {
+        status: "queued",
+        sender: this.#token,
+        sendUntil: Date.now() + SEND_LEASE_MS,
+      });
+    });
+    return await this.#attempt(mine as NotificationRecord, this.get(row.provider), msg);
   }
 
   /** Inbound messages of every provider; returns the unsubscribe. */
@@ -161,32 +207,91 @@ export class Notifications {
     for (const p of this.#providers.values()) await p.stop?.();
   }
 
+  /**
+   * Sends the reserved row, keeping its reservation alive meanwhile. Recording the outcome is apart from sending it: a
+   * write that fails (a busy db) after the provider accepted is retried as a write, never by sending again.
+   */
   async #attempt(
-    id: string,
+    row: NotificationRecord,
     p: Provider,
     msg: NotificationMessage,
-    done = 0,
     maxAttempts = this.#maxAttempts,
   ): Promise<NotificationRecord> {
-    const rows = this.store.collection(notifications);
-    let error = "";
-    for (let n = 1; n <= maxAttempts; n++) {
-      if (n > 1) await delay(this.#backoff(n - 1));
+    const done = Number(row.attempts ?? 0);
+    const renew = setInterval(() => {
+      void this.#ifMine(row.id, { sendUntil: Date.now() + SEND_LEASE_MS }).catch(() => {});
+    }, SEND_LEASE_MS / 3);
+    try {
+      let error = "";
+      for (let n = 1; n <= maxAttempts; n++) {
+        if (n > 1) await delay(this.#backoff(n - 1));
+        let externalId: string | undefined;
+        try {
+          ({ externalId } = await traced("notification.send", {
+            kind: SpanKind.client,
+            attributes: {
+              "notification.provider": p.id,
+              "notification.channel": p.channels[0],
+              "notification.attempt": n,
+            },
+          }, () => p.send(msg)));
+        } catch (err) {
+          error = err instanceof Error ? err.message : String(err);
+          continue;
+        }
+        return await this.#record(row.id, {
+          status: "sent",
+          attempts: done + n,
+          externalId: externalId ?? "",
+          error: "",
+          sender: "",
+          sendUntil: 0,
+        });
+      }
+      return await this.#record(row.id, {
+        status: "failed",
+        attempts: done + maxAttempts,
+        error: error.slice(0, 2000),
+        sender: "",
+        sendUntil: 0,
+      });
+    } finally {
+      clearInterval(renew);
+    }
+  }
+
+  /** Writes an outcome, retrying the write alone (a busy db); the send it records is never repeated for it. */
+  async #record(
+    id: string,
+    data: Partial<NotificationRecord> & { sender: string; sendUntil: number },
+  ): Promise<NotificationRecord> {
+    for (let i = 0;; i++) {
       try {
-        const { externalId } = await traced("notification.send", {
-          kind: SpanKind.client,
-          attributes: {
-            "notification.provider": p.id,
-            "notification.channel": p.channels[0],
-            "notification.attempt": n,
-          },
-        }, () => p.send(msg));
-        return await rows.update(id, { status: "sent", attempts: done + n, externalId: externalId ?? "", error: "" });
+        const r = await this.#ifMine(id, data);
+        // Another serve took the reservation while this one was frozen past it: its outcome is the one kept.
+        return r ?? (await this.store.collection(notifications).get(id)) as NotificationRecord;
       } catch (err) {
-        error = err instanceof Error ? err.message : String(err);
+        if (i >= RECORD_TRIES - 1) throw err;
+        await delay(RECORD_RETRY_MS * (i + 1));
       }
     }
-    return await rows.update(id, { status: "failed", attempts: done + maxAttempts, error: error.slice(0, 2000) });
+  }
+
+  /**
+   * Updates the row only while this registry still holds its reservation: a serve frozen past SEND_LEASE_MS wakes up
+   * with a renewal or an outcome to write, and must not take over a reservation another serve has since claimed.
+   * Null when it is no longer ours.
+   */
+  #ifMine(
+    id: string,
+    data: Partial<NotificationRecord> & { sender?: string; sendUntil?: number },
+  ): Promise<NotificationRecord | null> {
+    const rows = this.store.collection(notifications);
+    return tx(this.store.db, async () => {
+      const cur = await rows.get(id).catch(() => null);
+      if (!cur || cur.sender !== this.#token) return null;
+      return (await rows.update(id, data)) as NotificationRecord;
+    });
   }
 
   async #configRow(id: string) {
@@ -226,5 +331,12 @@ export class Notifications {
     if (rank[status] > rank[row.status as keyof typeof rank]) await rows.update(row.id, { status });
   }
 }
+
+/** How long a send reservation lasts unrenewed: a serve that died mid-send frees its row after it. */
+const SEND_LEASE_MS = 30_000;
+/** How often a duplicate call checks the row another sender holds. */
+const SEND_POLL_MS = 200;
+const RECORD_TRIES = 10;
+const RECORD_RETRY_MS = 100;
 
 const delay = (ms: number) => ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve();

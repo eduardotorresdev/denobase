@@ -1,4 +1,4 @@
-import { assert, assertEquals, assertRejects, assertStringIncludes } from "@std/assert";
+import { assert, assertEquals, assertRejects, assertStringIncludes, assertThrows } from "@std/assert";
 import { openDb } from "../core/db.ts";
 import { CurrentStorage } from "./current.ts";
 import { MemoryStorage, readAll } from "./storage.ts";
@@ -23,7 +23,10 @@ function setup(s3: S3Config) {
   const storage = new CurrentStorage(local);
   const settings = { s3: OFF };
   const runs: string[] = [];
+  /** Migrations a queue job holds (in the app: a pending or running row in _jobs). */
+  const held = new Set<string>();
   const mig = new FilesMigrations({
+    owned: (id) => held.has(id),
     aux,
     data,
     storage,
@@ -41,7 +44,7 @@ function setup(s3: S3Config) {
     storage.use(next);
     await mig.proposeFrom(prev, next);
   };
-  return { aux, data, local, storage, settings, mig, runs, switchTo, s3 };
+  return { aux, data, local, storage, settings, mig, runs, held, switchTo, s3 };
 }
 
 const put = (s: MemoryStorage, key: string, body: string) =>
@@ -120,7 +123,7 @@ Deno.test("delete-source runs only at the end and only with zero failures; a res
   }
 });
 
-Deno.test("S3 -> local, a stalled run is taken over from its cursor, a live lease is not", async () => {
+Deno.test("S3 -> local, a stalled run is taken over from its cursor, one its job holds is not", async () => {
   const fake = startFakeS3();
   const t = setup(OFF);
   try {
@@ -136,12 +139,13 @@ Deno.test("S3 -> local, a stalled run is taken over from its cursor, a live leas
     await t.switchTo(OFF);
     assertEquals(t.mig.status()!.from, `s3:${fake.config.bucket}@${fake.endpoint}`);
     const job = await t.mig.create();
-    // Someone else's run got to "a" and then died holding a lease that is still valid.
-    t.aux.prepare(`UPDATE _files_migrations SET owner = 'other', leaseUntil = ?, cursor = 'c1/r1/a.txt' WHERE id = ?`)
-      .run(Date.now() + 60_000, job.id);
-    assertEquals(await runMigration(job.id, { ...t, s3: OFF }), false);
+    // Someone else's run got to "a"; its queue job still holds the migration: not stalled, resume refuses.
+    t.aux.prepare(`UPDATE _files_migrations SET owner = 'other', cursor = 'c1/r1/a.txt' WHERE id = ?`).run(job.id);
+    t.held.add(job.id);
     assertEquals(t.mig.active()!.stalled, false);
-    t.aux.prepare(`UPDATE _files_migrations SET leaseUntil = 1 WHERE id = ?`).run(job.id);
+    assertThrows(() => t.mig.resume());
+    // The job is gone (it failed for good): the row is stalled and resume continues from the cursor.
+    t.held.delete(job.id);
     assertEquals(t.mig.active()!.stalled, true);
     t.mig.resume();
     await t.mig.running;

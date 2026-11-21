@@ -14,6 +14,8 @@ export interface Command {
   /** One line after the command name, e.g. "up|status|create" or "[--check]". */
   usage?: string;
   description?: string;
+  /** Left out of the usage (internal commands such as `__executor`). */
+  hidden?: boolean;
   /** Returns the exit code; void means 0. Throw UsageError for bad args (exit 2), anything else exits 1. */
   run(ctx: CommandContext): number | void | Promise<number | void>;
 }
@@ -73,7 +75,9 @@ export class Cli {
   }
 
   usage(): string {
-    const heads = this.commands().map((c) => [c.usage ? `${c.name} ${c.usage}` : c.name, c.description ?? ""]);
+    const heads = this.commands().filter((c) => !c.hidden).map((
+      c,
+    ) => [c.usage ? `${c.name} ${c.usage}` : c.name, c.description ?? ""]);
     const width = Math.max(0, ...heads.map(([h]) => h.length));
     const lines = heads.map(([h, d]) => (d ? `  ${h.padEnd(width)}  ${d}` : `  ${h}`));
     return ["usage: main.ts <command>", ...lines].join("\n");
@@ -83,6 +87,11 @@ export class Cli {
   async run(argv: string[]): Promise<number> {
     const { pos, flags, lists } = parseArgs(argv);
     const cmd = pos[0] ? this.#commands.get(pos[0]) : undefined;
+    // An executor runs only the executor command: a relaunch never chains into another serve or worker (§16 N1).
+    if (Deno.env.get("DENOBASE_EXECUTOR") && pos[0] !== "__executor") {
+      console.error("DENOBASE_EXECUTOR is set: only the internal __executor command runs here");
+      return 2;
+    }
     if (!cmd) {
       console.error(this.usage());
       return 2;

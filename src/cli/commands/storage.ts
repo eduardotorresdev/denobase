@@ -4,11 +4,11 @@ import { type Command, type CommandContext, UsageError } from "../engine.ts";
 import { createApp } from "../../app.ts";
 import { dataDirOf, DEFAULT_DB, openFileDb } from "../data.ts";
 import { CurrentStorage } from "../../files/current.ts";
+import { FILES_MIGRATION_JOB } from "../../files/tasks/migrate.ts";
 import {
   type MigrationSource,
   type MigrationState,
   planMigration,
-  runMigration,
   sourceLabel,
   sourceStorage,
 } from "../../files/migrate.ts";
@@ -94,14 +94,18 @@ async function migrate(
   }
   const storage = app.store.storage as CurrentStorage;
   const mig = app.filesMigration;
-  const run = (id: string) =>
-    runMigration(id, {
-      aux: app.logs.db,
-      data: app.db,
-      storage,
-      s3: () => app.settings.s3,
-      progress: (s) => console.log(line(s)),
-    });
+  // Through the queue, whose job is the migration's only lease (R8): with no node up this process runs it; with a
+  // serve or worker up, the one that holds the job does and this one follows the row.
+  const run = async (id: string) => {
+    const tick = setInterval(() => console.log(line(mig.get(id)!)), 1_000);
+    try {
+      await app.queue.run(FILES_MIGRATION_JOB, { id }, { dedupe: `files-migration:${id}` });
+    } catch (e) {
+      console.error(`error: ${(e as Error).message}`);
+    } finally {
+      clearInterval(tick);
+    }
+  };
 
   const source: MigrationSource = from === "s3" ? { kind: "s3", s3: fromS3(c) } : { kind: "local" };
   const deleteSource = c.flags["delete-source"] === true;
@@ -118,13 +122,7 @@ async function migrate(
       return 1;
     }
     console.log(`a files migration is already running (${active.from} -> ${active.to}): following it`);
-    // Run it here when its owner is gone; else watch the row until it ends.
-    while (!(await run(active.id))) {
-      const s = mig.get(active.id)!;
-      if (s.status !== "running") break;
-      console.log(line(s));
-      await new Promise((r) => setTimeout(r, 1000));
-    }
+    await run(active.id);
     const end = mig.get(active.id)!;
     console.log(line(end));
     return end.status === "done" ? 0 : 1;

@@ -1,6 +1,4 @@
-import { tuneConnection } from "../../core/db.ts";
-import { DatabaseSync } from "node:sqlite";
-import type { JobContext } from "../../jobs/context.ts";
+import type { DatabaseSync } from "node:sqlite";
 import { Logs } from "../../logs/mod.ts";
 import { MAX_SPAN_ROWS, Spans } from "../../telemetry/store.ts";
 import { RequestStats } from "../../telemetry/requests.ts";
@@ -35,7 +33,7 @@ export interface MaintenanceInput {
   maxDays?: number;
 }
 
-/** PB's maintenance work as it runs in a worker, each db on a connection of its own. */
+/** PB's maintenance work, on the connections of the process running the job (an executor, or inline). */
 export async function maintain(
   input: MaintenanceInput,
   db: () => DatabaseSync,
@@ -80,26 +78,5 @@ export async function maintain(
         if (walBytes(path) > WAL_TRUNCATE_BYTES) c().exec("PRAGMA wal_checkpoint(TRUNCATE);");
       }
       return;
-  }
-}
-
-/**
- * Job task (app.jobs): the cleanups write straight from the worker, on its internal connection with busy_timeout, in
- * short batches. Only internal tables (_logs, _spans, _otps, _oauth_*): no collection, so no hook, cache or realtime
- * listener can miss the write. Run through runTask (no context), it opens and closes connections of its own.
- */
-export default async function maintenanceTask(input: MaintenanceInput, ctx?: JobContext): Promise<void> {
-  if (ctx) return await maintain(input, () => ctx.internalDb("data"), () => ctx.internalDb("aux"));
-  const open: DatabaseSync[] = [];
-  const conn = (path: string) => () => {
-    const c = new DatabaseSync(path);
-    tuneConnection(c, { file: true });
-    open.push(c);
-    return c;
-  };
-  try {
-    await maintain(input, conn(input.dbPath), conn(input.auxPath));
-  } finally {
-    for (const c of open) c.close();
   }
 }

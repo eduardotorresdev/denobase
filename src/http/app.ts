@@ -15,8 +15,11 @@ import { fileRoutes } from "./files.ts";
 import { settingsRoutes } from "./settings.ts";
 import { activityLogger, logsRoutes } from "./logs.ts";
 import type { Logs } from "../logs/mod.ts";
-import type { Cron } from "../cron/mod.ts";
+import type { Queue } from "../queue/queue.ts";
 import { cronRoutes } from "./crons.ts";
+import { queueRoutes } from "./queue.ts";
+import { serviceRoutes } from "./services_admin.ts";
+import type { ServiceManager } from "../services/manager.ts";
 import type { Backups } from "../backups/mod.ts";
 import { backupRoutes } from "./backups.ts";
 import type { FilesMigrations } from "../files/migrate.ts";
@@ -57,7 +60,9 @@ export interface Ctx {
   traces: Spans;
   /** Request counts per hour for the admin home (_requests_hourly in the auxiliary db). */
   requests: RequestStats;
-  cron: Cron;
+  queue: Queue;
+  /** The long services (read late: the manager is built after the queue). */
+  services: () => ServiceManager;
   /** null without a pb_data dir: the backups API then answers PB's filesystem error. */
   backups: Backups | null;
   filesMigration: FilesMigrations;
@@ -155,6 +160,8 @@ export function createHttp(ctx: Ctx): Hono<AppEnv> {
   logsRoutes(app, ctx);
   traceRoutes(app, ctx);
   cronRoutes(app, ctx);
+  queueRoutes(app, ctx);
+  serviceRoutes(app, ctx);
   backupRoutes(app, ctx);
   filesMigrationRoutes(app, ctx);
   s3CheckRoutes(app, ctx);

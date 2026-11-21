@@ -79,6 +79,9 @@ export function guardedQuery(
   });
 }
 
+/** How long a guard worker may take to start before the query. */
+const BOOT_MS = 60_000;
+
 function runGuarded(path: string, sql: string, params: SQLInputValue[], opts: GuardOptions): Promise<GuardResult> {
   const req: GuardRequest = {
     path,
@@ -92,15 +95,24 @@ function runGuarded(path: string, sql: string, params: SQLInputValue[], opts: Gu
   const started = performance.now();
   const worker = new Worker(WORKER, { type: "module" });
   return new Promise<GuardResult>((resolve, reject) => {
-    const timer = setTimeout(() => {
+    const limit = opts.timeoutMs ?? 15_000;
+    const expire = (why: string) => () => {
       worker.terminate();
-      reject(new SqlRejected("limites", `tempo esgotado (${opts.timeoutMs ?? 15_000} ms)`));
-    }, opts.timeoutMs ?? 15_000);
+      reject(new SqlRejected("limites", why));
+    };
+    // The worker's start-up (a cold module graph on a loaded host) is not the query's time: it has its own, wider
+    // bound; the query's timeout starts once the worker says it began.
+    let timer = setTimeout(expire(`o executor não subiu (${BOOT_MS} ms)`), BOOT_MS);
     const done = () => {
       clearTimeout(timer);
       worker.terminate();
     };
-    worker.onmessage = (e: MessageEvent<GuardResponse>) => {
+    worker.onmessage = (e: MessageEvent<GuardResponse | { started: true }>) => {
+      if ("started" in e.data) {
+        clearTimeout(timer);
+        timer = setTimeout(expire(`tempo esgotado (${limit} ms)`), limit);
+        return;
+      }
       done();
       const r = e.data;
       if (r.ok) resolve({ ...r.result, latencyMs: Math.round(performance.now() - started) });
