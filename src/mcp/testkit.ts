@@ -6,6 +6,17 @@ import { registerCollections } from "../core/registry.ts";
 import { superusers } from "../core/superusers.ts";
 import type { Doc } from "../core/types.ts";
 import { dbWith, tokenFor } from "../testing/mod.ts";
+import { signToken } from "../auth/jwt.ts";
+import { mcpResource } from "./host.ts";
+
+/** A well-formed MCP token for an app user, which the MCP must refuse (only superusers use it). */
+async function userMcpToken(app: App, doc: Doc): Promise<string> {
+  const rec = app.db.prepare(`SELECT id, tokenKey FROM mt_users WHERE id = ?`).get(doc.id) as {
+    id: string;
+    tokenKey: string;
+  };
+  return await signToken("mt_users", rec, "auth", { refreshable: false, aud: mcpResource(app.settings.meta.appURL) });
+}
 
 /** Collections and principals the MCP tests share: an owner-scoped collection, a superuser-only one, a hidden field. */
 export const mt_users = defineCollection({
@@ -42,7 +53,10 @@ export interface Fixture {
   su: Doc;
   ana: Doc;
   bia: Doc;
-  /** MCP tokens (app.mcp.token: aud = this server's MCP URL), what requireAudience (the default) wants. */
+  /**
+   * MCP tokens (aud = this server's MCP URL), what requireAudience (the default) wants. su's comes from
+   * app.mcp.token; ana's and bia's are forged (app.mcp.token refuses app users), so tests can show /api/mcp 403s them.
+   */
   suToken: string;
   anaToken: string;
   biaToken: string;
@@ -72,8 +86,8 @@ export async function fixture(opts: Partial<AppOptions> = {}): Promise<Fixture> 
     notaAna,
     notaBia,
     suToken: await app.mcp.token("_superusers", su.id),
-    anaToken: await app.mcp.token("mt_users", ana.id),
-    biaToken: await app.mcp.token("mt_users", bia.id),
+    anaToken: await userMcpToken(app, ana),
+    biaToken: await userMcpToken(app, bia),
     anaSession: await tokenFor(db, "mt_users", ana),
   };
 }

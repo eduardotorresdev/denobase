@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { ensureMathFunctions, openDb } from "./core/db.ts";
 import { Logs } from "./logs/mod.ts";
+import { RequestStats } from "./telemetry/requests.ts";
 import { Spans } from "./telemetry/store.ts";
 import { Tracer } from "./telemetry/tracer.ts";
 import type { Attrs } from "./telemetry/span.ts";
@@ -127,6 +128,7 @@ export function createApp(opts: AppOptions): App {
   });
   const logs = new Logs(opts.auxDb ?? openDb());
   const traces = new Spans(logs.db);
+  const requests = new RequestStats(logs.db);
   const tracer = new Tracer(traces, () => settings.traces);
   const jobs = new JobRunner({ app: () => app, db, auxDb: logs.db, store, tracer });
   const backups = opts.dataDir
@@ -178,6 +180,7 @@ export function createApp(opts: AppOptions): App {
     logs,
     tracer,
     traces,
+    requests,
     cron,
     backups,
     filesMigration,
@@ -208,6 +211,7 @@ export function createApp(opts: AppOptions): App {
       }
       // Roots still open (requests and jobs in flight) get DRAIN_MS to finish; what stays open after that is lost.
       await tracer.drain();
+      requests.flush();
     })();
   const app: App = {
     db,

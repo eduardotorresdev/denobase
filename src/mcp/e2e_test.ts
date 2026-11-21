@@ -4,7 +4,7 @@ import { z } from "zod";
 import { fixture, structured } from "./testkit.ts";
 import { principalByEmail, serveMcpStdio, STDIO_SUPERUSER } from "./stdio.ts";
 
-Deno.test("e2e: the SDK client over a real socket on a free port, as a user, with a consumer tool", async () => {
+Deno.test("e2e: the SDK client over a real socket on a free port, as a superuser, with a consumer tool", async () => {
   const t = await fixture();
   t.app.mcp.tool({
     name: "pbs_eco",
@@ -21,12 +21,12 @@ Deno.test("e2e: the SDK client over a real socket on a free port, as a user, wit
         mode === "modern" ? { versionNegotiation: { mode: "auto" } } : undefined,
       );
       await client.connect(
-        new StreamableHTTPClientTransport(url, { requestInit: { headers: { Authorization: `Bearer ${t.anaToken}` } } }),
+        new StreamableHTTPClientTransport(url, { requestInit: { headers: { Authorization: `Bearer ${t.suToken}` } } }),
       );
       const r = await client.callTool({ name: "pbs_eco", arguments: { msg: "oi" } });
-      assertEquals(r.structuredContent, { msg: "oi", user: t.ana.id }, mode);
+      assertEquals(r.structuredContent, { msg: "oi", user: t.su.id }, mode);
       const list = structured(await client.callTool({ name: "db_list", arguments: { collection: "mt_notas" } }));
-      assertEquals((list.items as { titulo: string }[]).map((i) => i.titulo), ["da ana"], mode);
+      assertEquals((list.items as { titulo: string }[]).map((i) => i.titulo).sort(), ["da ana", "da bia"], mode);
       await client.close();
     }
   } finally {
@@ -53,16 +53,16 @@ Deno.test("stdio: without --as the session is superuser and sees the admin tools
   await s.close();
 });
 
-Deno.test("stdio: --as runs as that record, with its access rules", async () => {
+Deno.test("stdio: --as finds only superusers and runs as that one", async () => {
   const t = await fixture();
-  const ana = await principalByEmail(t.app, "ana@x.io");
-  assertEquals(ana?.collection, "mt_users");
+  const su = await principalByEmail(t.app, "su@x.io");
+  assertEquals([su?.collection, su?.id], ["_superusers", t.su.id]);
+  // An app user is not a principal of the MCP, the same as no account.
+  assertEquals(await principalByEmail(t.app, "ana@x.io"), null);
   assertEquals(await principalByEmail(t.app, "ninguem@x.io"), null);
-  const s = await stdioClient(t, ana);
+  const s = await stdioClient(t, su);
   const tools = (await s.client.listTools()).tools.map((x) => x.name);
-  assert(!tools.includes("db_sql"));
-  const list = structured(await s.client.callTool({ name: "db_list", arguments: { collection: "mt_notas" } }));
-  assertEquals((list.items as { titulo: string }[]).map((i) => i.titulo), ["da ana"]);
+  assert(tools.includes("db_sql"));
   await s.close();
 });
 

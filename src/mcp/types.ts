@@ -152,8 +152,6 @@ export interface McpOptions {
    * SPA is not accepted as an MCP credential. Default true; false is a dev convenience.
    */
   requireAudience?: boolean;
-  /** Serve guests (no token) with guest access rules instead of 401. Default false. */
-  allowGuest?: boolean;
   /** Tool text above this is truncated with `truncated: true`. Default 256 KiB. */
   maxResultBytes?: number;
   /** Per-call wall time. Default 30 s. */

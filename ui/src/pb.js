@@ -4,6 +4,11 @@ globalThis.app = globalThis.app || {};
 
 /** The SDK instance every page uses (PB UI's app.pb). Auth persists in localStorage under its own key. */
 globalThis.app.pb = new PocketBase(globalThis.location.origin, new LocalAuthStore("denobase_auth"));
+// Marks the panel's own calls, so the home's request and trace figures count the app's traffic, not the admin's.
+globalThis.app.pb.beforeSend = (url, options) => {
+  options.headers = { ...options.headers, "X-Denobase-Admin": "1" };
+  return { url, options };
+};
 
 /** True when a superuser session is loaded. */
 export function isSuperuser() {

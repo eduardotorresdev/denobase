@@ -1,4 +1,4 @@
-import { assertEquals } from "@std/assert";
+import { assert, assertEquals } from "@std/assert";
 import { DatabaseSync } from "node:sqlite";
 import { MAX_JSON, Spans } from "./store.ts";
 import type { SpanRecord } from "./span.ts";
@@ -114,16 +114,20 @@ Deno.test("store: oversized attributes and events keep only a marker", () => {
   assertEquals(r.events, [{ name: "truncated" }] as never);
 });
 
-Deno.test("store: deleteOlderThan drops old spans, truncate drops all, summary counts the last day", async () => {
+Deno.test("store: deleteOlderThan drops old spans, truncate drops all, the rollup follows both", async () => {
   const s = new Spans(new DatabaseSync(":memory:"));
   s.insertMany(trace(1, { start: T0 }, 1));
   s.insertMany(trace(2, { start: T0 + 2 * HOUR, status: 2, duration: 9 }, 1));
   await s.deleteOlderThan(new Date(T0 / 1000 + 3_600_000));
   assertEquals(s.listTraces().items.map((i) => i.traceId), [tid(2)]);
   assertEquals(s.spans(tid(1)), []);
-  assertEquals(s.summary(new Date(T0 / 1000)), { count: 1, errors: 1, p95: 9 });
+  const now = new Date(T0 / 1000 + 3 * 3_600_000);
+  const o = s.overview(now);
+  assertEquals([o.current.total, o.current.errors, o.previous.total], [1, 1, 0]);
+  assert(o.current.p95 >= 9 && o.current.p95 < 9 * 1.1, String(o.current.p95));
   s.truncate();
   assertEquals(s.listTraces().totalItems, 0);
+  assertEquals(s.overview(now).current.total, 0);
 });
 
 Deno.test("store: overall gives the period's percentiles; trimTo keeps the newest rows", async () => {
@@ -135,4 +139,76 @@ Deno.test("store: overall gives the period's percentiles; trimTo keeps the newes
   await s.trimTo(5);
   assertEquals(s.spans(tid(200)).length, 1);
   assertEquals(s.listTraces().totalItems, 5);
+});
+
+Deno.test("store: overview compares the last 24h with the 24h before, per hour and slowest route first", () => {
+  const s = new Spans(new DatabaseSync(":memory:"));
+  const now = new Date(T0 / 1000 + 30 * 3_600_000);
+  s.insertMany(trace(1, { start: T0, duration: 10 })); // 30h ago: the previous day
+  s.insertMany(trace(2, { start: T0 + 20 * HOUR, name: "GET /fast", duration: 5 }));
+  s.insertMany(trace(3, { start: T0 + 21 * HOUR, name: "GET /slow", duration: 500, status: 2 }));
+  s.insertMany(trace(4, { start: T0 + 21 * HOUR + 1, name: "GET /slow", duration: 700 }));
+  const o = s.overview(now, 24, 1);
+  assertEquals([o.previous.total, o.current.total, o.current.errors], [1, 3, 1]);
+  assertEquals(o.hours.map((h) => [h.date, h.total]), [
+    ["2026-01-02 06:00:00.000Z", 1],
+    ["2026-01-02 07:00:00.000Z", 2],
+  ]);
+  assertEquals(o.routes.map((r) => [r.name, r.total, r.errors]), [["GET /slow", 2, 1], ["GET /fast", 1, 0]]);
+  assert(o.routes[0].p95 >= 700 && o.routes[0].p95 < 770, String(o.routes[0].p95));
+  // With the default minimum sample (20 traces), none of these routes ranks.
+  assertEquals(s.overview(now).routes, []);
+});
+
+Deno.test("store: the rollup counts failed cron runs and leaves the admin UI's own requests out", () => {
+  const s = new Spans(new DatabaseSync(":memory:"));
+  const now = new Date(T0 / 1000 + 2 * 3_600_000);
+  s.insertMany(trace(1, { start: T0, name: "cron sync", status: 2 }));
+  s.insertMany(trace(2, { start: T0 + 1, name: "GET /api/settings", attributes: { "denobase.admin_ui": true } }));
+  const o = s.overview(now, 24, 1);
+  assertEquals([o.current.total, o.cronFailed.current], [1, 1]);
+  // Still stored and listed: only the home's figures skip it.
+  assertEquals(s.listTraces().totalItems, 2);
+});
+
+Deno.test("store: a db written before the rollup existed gets it built from its stored roots", () => {
+  const db = new DatabaseSync(":memory:");
+  const s = new Spans(db);
+  s.insertMany(trace(1, { start: T0, duration: 3 }));
+  db.exec("DROP TABLE _spans_hourly");
+  const reopened = new Spans(db);
+  assertEquals(reopened.overview(new Date(T0 / 1000 + 3_600_000)).current.total, 1);
+  // Built once: opening again does not count the roots twice.
+  assertEquals(new Spans(db).overview(new Date(T0 / 1000 + 3_600_000)).current.total, 1);
+});
+
+Deno.test("store: problems lists the newest failed or slow roots, maintenance crons and admin calls only when they failed", () => {
+  const s = new Spans(new DatabaseSync(":memory:"));
+  s.insertMany(trace(1, { start: T0, duration: 5 }));
+  const admin = { "denobase.admin_ui": true };
+  s.insertMany(trace(5, { start: T0 + 2, name: "GET /api/settings", duration: 3000, attributes: admin }));
+  s.insertMany(trace(6, { start: T0 + HOUR / 2, name: "GET /api/logs", status: 2, attributes: admin }));
+  s.insertMany(trace(4, { start: T0 + 2 * HOUR, name: "cron __denobaseWalCheckpoint__", duration: 1800 }));
+  s.insertMany(trace(2, { start: T0 + 1, status: 2 }, 2));
+  s.insertMany(trace(3, { start: T0 + HOUR, duration: 2000 }));
+  const p = s.problems(new Date(T0 / 1000 - 1), 1000);
+  assertEquals(p.map((x) => [x.traceId, x.spanCount]), [[tid(3), 2], [tid(6), 2], [tid(2), 3]]);
+});
+
+Deno.test("store: the list counts spans and errors only for the page, by the traceId index", () => {
+  const s = new Spans(new DatabaseSync(":memory:"));
+  const plans: string[] = [];
+  const prepare = s.db.prepare.bind(s.db);
+  s.db.prepare = ((sql: string) => {
+    if (sql.includes('"errorCount"')) {
+      plans.push(...(prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...sql.split("?").slice(1).map(() => null)) as {
+        detail: string;
+      }[]).map((r) => r.detail));
+    }
+    return prepare(sql);
+  }) as typeof s.db.prepare;
+  s.listTraces({ filter: "status=2", perPage: 5 });
+  // The status index made each root's error count scan every failed span, for every match before LIMIT.
+  assert(!plans.some((p) => p.includes("idx_spans_status_created")), plans.join("\n"));
+  assert(plans.some((p) => p.includes("idx_spans_trace")), plans.join("\n"));
 });

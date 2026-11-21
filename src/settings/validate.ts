@@ -69,10 +69,7 @@ export function validateSettings(s: Settings): Errs {
     }
   }
   if (s.oauth.codeTTL > 600) add("oauth", "codeTTL", err("validation_out_of_range", "Must be at most 600."));
-  if (typeof s.oauth.defaultCollection !== "string") {
-    add("oauth", "defaultCollection", err("validation_invalid_value", "Must be a collection name."));
-  }
-  for (const k of ["allowedCollections", "cimdAllowDomains", "cimdDenyDomains", "allowedRedirectHosts"] as const) {
+  for (const k of ["cimdAllowDomains", "cimdDenyDomains", "allowedRedirectHosts"] as const) {
     if (!Array.isArray(s.oauth[k]) || s.oauth[k].some((h) => typeof h !== "string")) {
       add("oauth", k, err("validation_invalid_value", "Must be a list of names."));
     }

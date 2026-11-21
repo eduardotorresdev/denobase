@@ -2,6 +2,7 @@ import type { Hono } from "hono";
 import type { DatabaseSync } from "node:sqlite";
 import type { AppEnv, Ctx } from "./app.ts";
 import { requireSuperuser } from "./guards.ts";
+import { dashboardRoutes } from "./dashboard.ts";
 
 /** Size in bytes of the main db file, or null for :memory: and whatever cannot be stat'ed (the path stays private). */
 export function dbSizeBytes(db: DatabaseSync): number | null {
@@ -43,40 +44,14 @@ export function statsPayload(ctx: Ctx): Record<string, unknown> {
     process: { rss: p.rss, heapTotal: p.heapTotal, heapUsed: p.heapUsed },
     collections: ctx.collections.length,
     dbSizeBytes: dbSizeBytes(ctx.db),
-    traces: tracesSummary(ctx),
   };
 }
 
-/** The 24h trace figures, computed at most once per SUMMARY_TTL_MS however often the dashboard polls. */
-const SUMMARY_TTL_MS = 30_000;
-const summaries = new WeakMap<object, { at: number; value: { count24h: number; errors24h: number; p95: number } }>();
-function tracesSummary(ctx: Ctx) {
-  const hit = summaries.get(ctx.traces);
-  if (hit && performance.now() - hit.at < SUMMARY_TTL_MS) return hit.value;
-  const s = ctx.traces.summary(new Date(Date.now() - 86_400_000));
-  const value = { count24h: s.count, errors24h: s.errors, p95: s.p95 };
-  summaries.set(ctx.traces, { at: performance.now(), value });
-  return value;
-}
-
-/** The dashboard's 24h request traffic, scanned at most once per SUMMARY_TTL_MS however often it is opened. */
-const traffics = new WeakMap<object, { at: number; value: ReturnType<Ctx["logs"]["traffic"]> }>();
-export function trafficPayload(ctx: Ctx) {
-  const hit = traffics.get(ctx.logs);
-  if (hit && performance.now() - hit.at < SUMMARY_TTL_MS) return hit.value;
-  const value = ctx.logs.traffic(new Date(Date.now() - 86_400_000));
-  traffics.set(ctx.logs, { at: performance.now(), value });
-  return value;
-}
-
-/** GET /api/_denobase/stats and /api/_denobase/traffic, superuser-only. */
+/** GET /api/_denobase/stats (superuser-only) and the home's card endpoints. */
 export function statsRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
   app.get("/api/_denobase/stats", (c) => {
     requireSuperuser(c);
     return c.json(statsPayload(ctx));
   });
-  app.get("/api/_denobase/traffic", (c) => {
-    requireSuperuser(c);
-    return c.json(trafficPayload(ctx));
-  });
+  dashboardRoutes(app, ctx);
 }

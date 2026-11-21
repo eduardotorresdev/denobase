@@ -81,8 +81,8 @@ Deno.test("oauth pages: in pt-BR, login, code, consent, error, expired and hando
   const b = new Browser(t.app);
   const login = await (await b.get(authorizeQuery(t.clientId))).text();
   const txn = hidden(login, "txn");
-  const otp = await (await b.post("/oauth/otp/request", { txn, csrf: txnCsrf(t.app, txn), email: "ana@x.io" })).text();
-  const { html: consent } = await toConsent(new Browser(t.app), t.clientId, { email: "ana@x.io" }, {
+  const otp = await (await b.post("/oauth/otp/request", { txn, csrf: txnCsrf(t.app, txn), email: "su@x.io" })).text();
+  const { html: consent } = await toConsent(new Browser(t.app), t.clientId, { email: "su@x.io" }, {
     scope: "mcp mcp:read mcp:write offline_access",
   });
   const errors = Object.values(pt).filter((v): v is string => typeof v === "string").map((v) =>

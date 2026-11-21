@@ -49,14 +49,7 @@ const FIELDS = {
     ["traces", "propagateHosts", "Send traceparent to these hosts (comma separated)", "list"],
   ],
   oauth: [
-    ["oauth", "enabled", "Enable OAuth for the MCP (clients sign users in on this server)", "bool"],
-    ["oauth", "allowedCollections", "Collections that may authorize (comma separated, empty = all in code)", "list"],
-    [
-      "oauth",
-      "defaultCollection",
-      "Collection a request signs in against when it does not name one (auth_collection)",
-      "text",
-    ],
+    ["oauth", "enabled", "Enable OAuth for the MCP (superusers sign in on this server)", "bool"],
     ["oauth", "accessTokenTTL", "Access token lifetime (seconds)", "number"],
     ["oauth", "refreshTokenTTL", "Refresh token lifetime (seconds, renewed on every use)", "number"],
     ["oauth", "codeTTL", "Authorization code lifetime (seconds)", "number"],

@@ -24,13 +24,6 @@ import type { TraceSettings } from "../telemetry/buffer.ts";
  */
 export interface OAuthSettings {
   enabled: boolean;
-  /** Auth collections that may authorize; always narrowed to the code's McpOptions.oauth.collections. Empty: all. */
-  allowedCollections: string[];
-  /**
-   * The collection a request signs in against when /oauth/authorize carries no auth_collection. When it is not among
-   * the collections that may authorize, the first of those is used.
-   */
-  defaultCollection: string;
   accessTokenTTL: number;
   /** Sliding: every rotation starts a new window. */
   refreshTokenTTL: number;

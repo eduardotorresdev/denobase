@@ -25,19 +25,19 @@ with `createCli()`, adding or replacing commands with `cli.add`.
   snake_case `data.code`; `CODE_PERMISSION_DENIED` (`permissao_negada`) is every authorization 403.
 - Custom realtime topics: `app.realtime.publish(topic, data, { access })`: exact topic match, authenticated clients by
   default, sent after commit. Mail: `Mail` takes to/cc/bcc lists, replyTo, attachments, headers.
-- MCP is native (`src/mcp/`): `POST /api/mcp` (Streamable HTTP, both protocol eras) and the `mcp` CLI command (stdio,
-  superuser unless `--as <email>`). The consumer extends it through `app.mcp.tool`, `resource`, `resourceTemplate` and
-  `prompt` (zod input, `visibility`/`allow`); handlers get `ctx.store` = `app.store.as(user)`, so access rules apply as
-  on REST, and a thrown `ApiError` becomes `isError` with its stable code. Built-ins are prefixed `db_`.
+- MCP is native (`src/mcp/`) and for superusers only: `POST /api/mcp` (Streamable HTTP, both protocol eras; a guest 401,
+  any other auth record 403) and the `mcp` CLI command (stdio, the implicit superuser or `--as <superuser email>`). The
+  consumer extends it through `app.mcp.tool`, `resource`, `resourceTemplate` and `prompt` (zod input,
+  `visibility`/`allow`); handlers get `ctx.store` = `app.store.as(user)`, so access rules apply as on REST, and a thrown
+  `ApiError` becomes `isError` with its stable code. Built-ins are prefixed `db_`.
 - OAuth for the MCP is native (`src/oauth/`): the app is its own authorization server. A client (DCR, an https client_id
   document, or `McpOptions.oauth.clients`) sends the user to `/oauth/authorize`; the user signs in and approves on
   server-rendered pages (own httpOnly cookie, no SPA), and the client gets the app's auth JWT (`aud` =
-  `<appURL>/api/mcp`, claims `scope`/`cid`/`gid`) plus a rotating refresh token. Who may authorize is
-  `McpOptions.oauth.collections` (default `["_superusers"]`), narrowed by `settings.oauth`; which one a request signs in
-  against is picked by whoever launches it (`auth_collection`, or the server URL `/api/mcp/<collection>`, else
-  `settings.oauth.defaultCollection`), and the login page stays opaque about it (no selector, one generic failure).
-  Scopes (`mcp`, `mcp:read`, `mcp:write`, app scopes) only narrow the tools; access rules still decide. Revocation is
-  immediate (`gid` is checked per request). `app.mcp.token` stays the manual path for CI and scripts.
+  `<appURL>/api/mcp`, claims `scope`/`cid`/`gid`) plus a rotating refresh token. Only superusers authorize: app users
+  never sign in on these pages, they use the app's own auth (password, its OAuth2/OIDC providers); an account of another
+  collection fails exactly like a wrong password. Scopes (`mcp`, `mcp:read`, `mcp:write`, app scopes) only narrow the
+  tools; access rules still decide. Revocation is immediate (`gid` is checked per request). `app.mcp.token` stays the
+  manual path for CI and scripts.
 - Tracing is native (`src/telemetry/`): `app.tracer.span(name, attrs, fn)` for consumer work; requests, cron runs, SQL,
   tx, hooks, CRUD, batch, realtime, mail, notifications and `app.tracer.fetch` are traced on their own. Spans go to
   `_spans` in the auxiliary db; read them in tests with `collectSpans(app)`.

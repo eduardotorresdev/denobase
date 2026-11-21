@@ -17,11 +17,6 @@ export interface StaticClient {
   scope?: string;
   logoUri?: string;
   uri?: string;
-  /**
-   * The auth collection this client always signs in against. A request may then omit `auth_collection` or repeat this
-   * same value; any other is invalid_request.
-   */
-  authCollection?: string;
 }
 
 /** What an authorization is about, as onAuthorize sees it. */
@@ -47,12 +42,6 @@ export interface OAuthBranding {
 export interface OAuthOptions {
   /** Default true (when the MCP is enabled); settings.oauth.enabled can still turn it off at runtime. */
   enabled?: boolean;
-  /**
-   * Auth collections whose records may authorize. Default ["_superusers"]. Which one a request signs in against is
-   * chosen by whoever starts it (`auth_collection` on /oauth/authorize, else settings.oauth.defaultCollection), never
-   * by the login page, which stays the same for all of them.
-   */
-  collections?: string[];
   /** Scopes besides mcp, mcp:read, mcp:write and offline_access. */
   scopes?: OAuthScope[];
   /** Other resource URLs (RFC 8707) a token may be requested for besides <base>/api/mcp. */
@@ -102,8 +91,6 @@ export interface OAuthClient {
   secretHash: string;
   created: string;
   lastUsed: string;
-  /** Static clients only: the auth collection the client always signs in against. */
-  authCollection?: string;
 }
 
 export interface OAuthGrant {
@@ -138,7 +125,7 @@ export interface OAuthRequest {
   csrf: string;
   /** SHA-256 of the browser cookie that started the request: only that browser may sign in to it. */
   bindHash: string;
-  /** The auth collection this request signs in against (auth_collection), fixed when it was validated. */
+  /** The auth collection this request signs in against: always _superusers (only they use the MCP). */
   collection: string;
   /** 1 once the silent handoff (the web app's own session) was tried for this request: once per request, never more. */
   webTried: number;

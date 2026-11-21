@@ -55,7 +55,7 @@ Deno.test("oauth introspect: off by default; on, a superuser sees active and ina
   const look = async (tok: string, auth: string) =>
     await (await post(t.app, "/oauth/introspect", { token: tok }, { Authorization: auth })).json();
   const a = await look(tk.access_token, t.suSession);
-  assertEquals([a.active, a.scope, a.client_id, a.sub], [true, "mcp", t.clientId, t.ana.id]);
+  assertEquals([a.active, a.scope, a.client_id, a.sub], [true, "mcp", t.clientId, t.su.id]);
   assertEquals((await look("garbage", t.suSession)).active, false);
   assertEquals((await post(t.app, "/oauth/introspect", { token: tk.access_token, client_id: t.clientId })).status, 401);
 });

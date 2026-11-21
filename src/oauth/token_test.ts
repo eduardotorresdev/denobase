@@ -137,7 +137,7 @@ Deno.test("oauth token: the resource compares in canonical form (trailing slash,
 Deno.test("oauth token: a changed tokenKey (password change) makes the refresh invalid_grant", async () => {
   const t = await oauthFixture();
   const tk = await tokens(t);
-  t.app.db.prepare(`UPDATE mt_users SET tokenKey = 'rotated' WHERE id = ?`).run(t.ana.id);
+  t.app.db.prepare(`UPDATE _superusers SET tokenKey = 'rotated' WHERE id = ?`).run(t.su.id);
   const r = await token(t.app, { grant_type: "refresh_token", client_id: t.clientId, refresh_token: tk.refresh_token });
   assertEquals(r.body.error, "invalid_grant");
   // And the access token, signed with the old key, no longer verifies.

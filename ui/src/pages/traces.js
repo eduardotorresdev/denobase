@@ -1,5 +1,5 @@
 // Traces: real spans from /api/traces (denobase telemetry, _spans in the aux db). List page in the logs.js
-// pattern, detail page (#/traces/{id}) with the span waterfall, and the dashboard card.
+// pattern, detail page (#/traces/{id}) with the span waterfall.
 
 import {
   badge,
@@ -14,16 +14,16 @@ import {
   page,
   pager,
   pbDate,
-  stat,
   toast,
 } from "../ui.js";
 import { showLog, statsChart } from "./logs.js";
 
 export const KINDS = ["internal", "server", "client", "producer", "consumer"];
+// OTel's UNSET is "no error recorded": shown as ok, like an explicit OK; only errors stand out.
 const STATUS = [
-  { value: 0, label: "UNSET", kind: "neutral" },
-  { value: 1, label: "OK", kind: "success" },
-  { value: 2, label: "ERROR", kind: "danger" },
+  { value: 0, label: "ok", kind: "neutral" },
+  { value: 1, label: "ok", kind: "neutral" },
+  { value: 2, label: "error", kind: "danger" },
 ];
 const TRACE_ID = /^[0-9a-f]{32}$/i;
 const PERIODS = [
@@ -122,13 +122,15 @@ function tracesTable(items, onOpen) {
 /** Trace list: filter bar + chips, hourly chart (errors in black) with percentiles, dense table. */
 function listPage(route) {
   const initial = route?.query?.filter?.[0] || "";
+  // A link may pick the period (#/traces?period=1h&filter=...), e.g. the home's "failed sign-ins in the last hour".
+  const period = { "1h": 0, "24h": 1, "7d": 2 }[route?.query?.period?.[0]] ?? 1;
   const s = store({
     filter: initial,
     draft: initial,
     errorsOnly: false,
     slowOnly: false,
     kind: "",
-    period: 1,
+    period,
     page: 1,
     perPage: 50,
     totalItems: 0,
@@ -148,8 +150,6 @@ function listPage(route) {
     if (s.kind === "http") parts.push("kind=1");
     if (s.kind === "cron") parts.push('name~"cron "');
     if (s.kind === "worker") parts.push('name~"worker "');
-    const p = PERIODS[s.period];
-    if (p) parts.push(`created>="${pbDate(new Date(Date.now() - p.ms))}"`);
     return parts.join("&&");
   }
 
@@ -157,8 +157,11 @@ function listPage(route) {
     s.loading = true;
     s.error = null;
     const filter = fullFilter();
+    // The period goes apart from the filter: the server applies it to the roots by index.
+    const p = PERIODS[s.period];
+    const since = p ? new Date(Date.now() - p.ms).toISOString().replace("T", " ") : "";
     try {
-      const q = (o) => new URLSearchParams(o).toString();
+      const q = (o) => new URLSearchParams({ ...o, since }).toString();
       const [list, stats, sum] = await Promise.all([
         api(`/api/traces?${q({ filter, sort: "-start", page: s.page, perPage: s.perPage })}`, {
           requestKey: "traces-list",
@@ -224,7 +227,7 @@ function listPage(route) {
             : null,
         ),
       ),
-      s.stats.length ? statsChart(chartRows(s.stats)) : empty("No traces for this filter."),
+      s.stats.length ? statsChart(chartRows(s.stats)) : s.loading ? loading() : empty("No traces for this filter."),
     );
   });
 
@@ -375,9 +378,9 @@ function waterfall(root, onSelect) {
       t.div(
         { className: "trace-span-head trace-span-cols" },
         t.span({ textContent: "Span" }),
-        t.span({ textContent: "Tipo" }),
-        t.span({ className: "num", textContent: "Início", title: "Quando o span começou, contado do início do trace" }),
-        t.span({ className: "num", textContent: "Duração", title: "Quanto tempo o span levou" }),
+        t.span({ textContent: "Kind" }),
+        t.span({ className: "num", textContent: "Start", title: "When the span started, from the start of the trace" }),
+        t.span({ className: "num", textContent: "Duration", title: "How long the span took" }),
       ),
       ...flat.map(([n, depth]) => {
         const off = (n.start - t0) / 1000;
@@ -487,40 +490,4 @@ async function detailPage(id) {
 export function render(route) {
   const id = route?.params?.id;
   return id ? detailPage(id) : listPage(route);
-}
-
-/** Dashboard card body: 24h KPIs from /api/traces/stats, hourly bars, latest slow/error traces. */
-export async function tracesCard() {
-  const since = `created>="${pbDate(new Date(Date.now() - 864e5))}"`;
-  const q = (o) => new URLSearchParams(o).toString();
-  const [stats, sum, bad] = await Promise.all([
-    api(`/api/traces/stats?${q({ filter: since })}`, { requestKey: "dash-traces-stats" }),
-    api(`/api/traces/stats?${q({ filter: since, groupBy: "total" })}`, { requestKey: "dash-traces-total" }),
-    api(`/api/traces?${q({ filter: `${since}&&(${ERRORS}||${slowFilter()})`, sort: "-start", perPage: 5 })}`, {
-      requestKey: "dash-traces-bad",
-    }),
-  ]);
-  return t.div(
-    { className: "stack" },
-    stat(
-      sum.total ? `p95 ${ms(sum.p95)}` : "–",
-      `${sum.total} traces · ${sum.errors} errors`,
-      sum.total ? `p50 ${ms(sum.p50)} · p99 ${ms(sum.p99)}` : "",
-    ),
-    statsChart(chartRows(stats), 64),
-    bad.items.length
-      ? t.div(
-        null,
-        t.div({ className: "muted", style: "font-size:12px", textContent: "Latest slow / error traces" }),
-        ...bad.items.map((tr) =>
-          t.a(
-            { className: "log-line", href: `#/traces/${tr.traceId}`, style: "color:inherit;text-decoration:none" },
-            statusBadge(tr.status),
-            t.span({ className: "mono log-url", title: tr.name, textContent: tr.name }),
-            t.span({ className: "mono muted", textContent: ms(tr.duration) }),
-          )
-        ),
-      )
-      : t.div({ className: "muted", textContent: "No slow or failed traces in 24h." }),
-  );
 }

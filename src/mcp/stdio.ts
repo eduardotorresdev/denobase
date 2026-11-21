@@ -8,18 +8,12 @@ import { buildServer, mcpContext } from "./server.ts";
 /** The implicit principal of a stdio session without --as: whoever runs the process already owns the db file. */
 export const STDIO_SUPERUSER: AuthUser = { id: "", collection: "_superusers", record: { id: "" } };
 
-/** Auth record by email across the app's auth collections (superusers first), as the principal of a session. */
+/** The superuser with this email, as the principal of a session; only superusers use the MCP. */
 export async function principalByEmail(app: App, email: string): Promise<AuthUser | null> {
-  const host = app.mcp as McpHost;
-  const auth = host.http.collections.filter((c) => c.auth)
-    .sort((a, b) => Number(b.slug === "_superusers") - Number(a.slug === "_superusers"));
-  for (const c of auth) {
-    const doc = await app.store.collection(c.slug).query().where({ email: { equals: email } }).first() as
-      | Doc
-      | undefined;
-    if (doc) return { id: doc.id, collection: c.slug, record: publicAuthRecord(doc) };
-  }
-  return null;
+  const doc = await app.store.collection("_superusers").query().where({ email: { equals: email } }).first() as
+    | Doc
+    | undefined;
+  return doc ? { id: doc.id, collection: "_superusers", record: publicAuthRecord(doc) } : null;
 }
 
 /**

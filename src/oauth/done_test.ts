@@ -18,7 +18,7 @@ Deno.test("oauth done: allowing a loopback client shows the final page and deliv
   assertEquals([u.searchParams.get("state"), u.searchParams.get("iss")], ["st-1", ISSUER]);
   assertMatch(html, /<iframe class="oa-deliver" src="http:\/\/127\.0\.0\.1:33418\/callback\?code=[^"]+" sandbox /);
   assertStringIncludes(html, "Access authorized");
-  assertStringIncludes(html, "ana@x.io");
+  assertStringIncludes(html, "su@x.io");
   assertStringIncludes(html, "close this tab");
   assertStringIncludes(html, "<svg");
   assertFalse(html.includes("http-equiv"));

@@ -61,8 +61,6 @@ export function defaultSettings(): Settings {
     },
     oauth: {
       enabled: true,
-      allowedCollections: [],
-      defaultCollection: "users",
       accessTokenTTL: 3600,
       refreshTokenTTL: 30 * 86400,
       codeTTL: 60,

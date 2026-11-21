@@ -1,6 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { syncExternalCommits } from "../core/coherence.ts";
-import { Hono } from "hono";
+import { Hono, type MiddlewareHandler } from "hono";
 import { cors } from "hono/cors";
 import type { Mailer } from "../auth/mailer.ts";
 import type { AuthUser, CollectionConfig } from "../core/types.ts";
@@ -33,7 +33,8 @@ import { audienceAllows, mcpRoutes } from "../mcp/http.ts";
 import { oauthRoutes } from "../oauth/mod.ts";
 import type { Spans } from "../telemetry/store.ts";
 import type { Tracer } from "../telemetry/tracer.ts";
-import { tracingMiddleware } from "../telemetry/instrument/http.ts";
+import { ADMIN_UI_HEADER, isTraced, tracingMiddleware } from "../telemetry/instrument/http.ts";
+import type { RequestStats } from "../telemetry/requests.ts";
 import { traced } from "../telemetry/instrument/child.ts";
 import { traceRoutes } from "./traces.ts";
 import type { PathRedactor } from "./redact_path.ts";
@@ -54,6 +55,8 @@ export interface Ctx {
   logs: Logs;
   tracer: Tracer;
   traces: Spans;
+  /** Request counts per hour for the admin home (_requests_hourly in the auxiliary db). */
+  requests: RequestStats;
   cron: Cron;
   /** null without a pb_data dir: the backups API then answers PB's filesystem error. */
   backups: Backups | null;
@@ -64,6 +67,26 @@ export interface Ctx {
   mcp: McpHost;
   /** Paths with a credential in a segment, masked in the activity log and the request span (app.redactPath). */
   redactor: PathRedactor;
+}
+
+const SIGN_IN = /^\/api\/collections\/[^/]+\/auth-with-(password|otp)$/;
+
+/**
+ * Feeds the admin home's request counts. The paths tracing skips (the admin UI, its own dashboard reads, health,
+ * realtime) stay out too, and so do the admin UI's own calls (ADMIN_UI_HEADER), so using the panel never shows up in
+ * the figures it draws.
+ */
+function requestStats(stats: RequestStats): MiddlewareHandler<AppEnv> {
+  return async (c, next) => {
+    if (!isTraced(c.req.path) || c.req.header(ADMIN_UI_HEADER)) return await next();
+    const started = performance.now();
+    try {
+      await next();
+    } finally {
+      const status = c.res.status;
+      stats.record(status, performance.now() - started, status === 400 && SIGN_IN.test(c.req.path));
+    }
+  };
 }
 
 /** PB accepts both "Bearer x" and a raw token in Authorization. */
@@ -99,6 +122,7 @@ export function createHttp(ctx: Ctx): Hono<AppEnv> {
     syncExternalCommits(ctx.db);
     await next();
   });
+  app.use("*", requestStats(ctx.requests));
   app.use("*", activityLogger(ctx));
   // Multipart uploads spool to temp files for the request; they go when it ends, stored or not.
   app.use("*", (_c, next) => withSpoolScope(next));
