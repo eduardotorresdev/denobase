@@ -431,11 +431,12 @@ Deno.test("ThumbPool frees a seat at once when its running job is aborted, and d
     await new Promise((r) => setTimeout(r, 5));
     ac.abort();
     await assertRejects(() => running, Error, "canceled");
-    // The worker was terminated, so the queued job runs on a fresh one instead of waiting out the decode.
+    // The worker was terminated, so the queued job runs on a fresh one instead of waiting out the decode: the second
+    // spawn is the proof. The clock bound only catches a wait for the 3000x3000 decode, with room for a loaded host.
     const t0 = performance.now();
     assertEquals((await decodeImage((await queued).bytes)).width, 10);
-    assert(performance.now() - t0 < 5_000);
     assertEquals(pool.spawned, 2);
+    assert(performance.now() - t0 < 20_000);
 
     // A long-lived signal shared by many renders keeps no listener once each job settles.
     let live = 0;

@@ -110,7 +110,8 @@ Deno.test("retention: the traces cleanup job drops spans older than settings.tra
   ]);
   app.tracer.startRoot("fresh").end();
   app.tracer.flush();
-  await app.cron.get("__denobaseTracesCleanup__")!.run();
+  await app.queue.runNow("__denobaseTracesCleanup__");
+  await app.queue.drain();
   app.tracer.flush();
   assertEquals(app.traces.listTraces({ filter: "name!~'cron'" }).items.map((i) => i.name), ["fresh"]);
 });

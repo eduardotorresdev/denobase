@@ -2,7 +2,7 @@ import process from "node:process";
 import { FsStorage } from "../../files/storage.ts";
 import { openDb } from "../../core/db.ts";
 import { type Command, UsageError } from "../engine.ts";
-import { createApp } from "../../app.ts";
+import { createApp, loadSetup } from "../../app.ts";
 import { dataDirOf, DEFAULT_DB, openFileDb } from "../data.ts";
 import { principalByEmail, serveMcpStdio, STDIO_SUPERUSER } from "../../mcp/stdio.ts";
 import type { ServeOptions } from "./serve.ts";
@@ -30,7 +30,11 @@ export function mcpCommand(opts: ServeOptions = {}): Command {
         auxDb: openDb(`${own ?? "."}/auxiliary.db`),
         dataDir: own ?? undefined,
         adminUiDir: false,
+        setup: opts.setup,
+        // Long services (a WhatsApp session) belong to the serve: here a provide() is skipped.
+        role: "mcp",
       });
+      await loadSetup(app);
       await opts.beforeServe?.(app);
       const email = c.str("as");
       const user = email ? await principalByEmail(app, email) : STDIO_SUPERUSER;

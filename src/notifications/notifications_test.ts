@@ -314,3 +314,89 @@ Deno.test("email: off unless asked; the default registry has no e-mail provider"
   const t = await setup();
   assertEquals(t.n.list().map((p) => p.id), ["fake"]);
 });
+
+Deno.test("send under a call key: a sent row is the answer; a row left queued (the serve died mid-send) is sent again", async () => {
+  const t = await setup();
+  await t.app.services.provide("t_n", { send: (m: NotificationMessage) => t.n.send(m) }, { startSecs: 0 });
+  const call = (key: string) => t.app.services.execute("t_n", "send", [{ provider: "fake", to: "1", text: "x" }], key);
+  const first = await call("k1") as { id: string; status: string };
+  const again = await call("k1") as { id: string; status: string };
+  assertEquals([again.id, again.status, t.fake.sent.length], [first.id, "sent", 1]);
+  // A previous call that logged its row and never got to the provider.
+  const stuck = await t.app.store.collection(notifications).create(
+    { idem: "k2", provider: "fake", channel: "whatsapp", to: "1", text: "x", status: "queued", attempts: 0 } as never,
+  );
+  const r = await call("k2") as { id: string; status: string };
+  assertEquals([r.id, r.status, t.fake.sent.length], [stuck.id, "sent", 2]);
+});
+
+Deno.test("send under a call key: a row another sender holds is waited for, never sent twice; a lapsed hold is taken over", async () => {
+  const t = await setup();
+  await t.app.services.provide("t_n", { send: (m: NotificationMessage) => t.n.send(m) }, { startSecs: 0 });
+  const call = (key: string) => t.app.services.execute("t_n", "send", [{ provider: "fake", to: "1", text: "x" }], key);
+  const rows = t.app.store.collection(notifications);
+  const base = { provider: "fake", channel: "whatsapp", to: "1", text: "x", status: "queued", attempts: 0 };
+  // Another serve is sending k3 right now (its hold is live): this call waits for its outcome.
+  const held = await rows.create({ ...base, idem: "k3", sender: "other", sendUntil: Date.now() + 60_000 } as never);
+  const waiting = call("k3") as Promise<{ id: string; status: string }>;
+  await new Promise((r) => setTimeout(r, 300));
+  assertEquals(t.fake.sent.length, 0);
+  await rows.update(held.id, { status: "sent", externalId: "theirs", sender: "", sendUntil: 0 } as never);
+  const r = await waiting;
+  assertEquals([r.id, r.status, t.fake.sent.length], [held.id, "sent", 0]);
+  // A hold whose serve died (lapsed): taken over and sent.
+  const dead = await rows.create({ ...base, idem: "k4", sender: "gone", sendUntil: Date.now() - 1 } as never);
+  const r2 = await call("k4") as { id: string; status: string };
+  assertEquals([r2.id, r2.status, t.fake.sent.length], [dead.id, "sent", 1]);
+});
+
+Deno.test("send: a failed write of the outcome is retried as a write; the provider is not asked again", async () => {
+  const t = await setup();
+  const store = t.app.store;
+  const real = store.collection.bind(store);
+  let writes = 0;
+  // The db is busy right when the outcome is written, twice.
+  (store as { collection: unknown }).collection = (c: never) => {
+    const cs = real(c);
+    return {
+      ...cs,
+      query: cs.query.bind(cs),
+      create: cs.create.bind(cs),
+      get: cs.get.bind(cs),
+      update: (id: string, data: Record<string, unknown>) =>
+        data.status === "sent" && ++writes <= 2
+          ? Promise.reject(new Error("database is locked"))
+          : cs.update(id, data as never),
+    };
+  };
+  try {
+    const row = await t.n.send({ provider: "fake", to: "1", text: "x" });
+    // Two failed writes and the third one lands; the provider sent once.
+    assertEquals([row.status, t.fake.sent.length, writes], ["sent", 1, 3]);
+  } finally {
+    (store as { collection: unknown }).collection = real;
+  }
+});
+
+Deno.test("send: a serve frozen past its hold writes neither a renewal nor its outcome over the serve that took it", async () => {
+  const t = await setup();
+  const rows = t.app.store.collection(notifications);
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  const real = t.fake.send.bind(t.fake);
+  // The provider call hangs, as a serve stopped mid-send by SIGSTOP would.
+  t.fake.send = async (m) => (await gate, real(m));
+  const sending = t.n.send({ provider: "fake", to: "1", text: "x" });
+  let row: { id: string } | undefined;
+  for (let i = 0; i < 50 && !row; i++) {
+    await new Promise((r) => setTimeout(r, 20));
+    row = (await rows.query().first()) as { id: string } | undefined;
+  }
+  // Its hold lapsed and another serve took the reservation.
+  const until = Date.now() + 60_000;
+  await rows.update(row!.id, { sender: "other", sendUntil: until } as never);
+  release();
+  await sending;
+  const now = await rows.get(row!.id) as unknown as { status: string; sender: string; sendUntil: number };
+  assertEquals([now.status, now.sender, now.sendUntil], ["queued", "other", until]);
+});

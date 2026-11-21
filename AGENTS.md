@@ -38,9 +38,21 @@ with `createCli()`, adding or replacing commands with `cli.add`.
   collection fails exactly like a wrong password. Scopes (`mcp`, `mcp:read`, `mcp:write`, app scopes) only narrow the
   tools; access rules still decide. Revocation is immediate (`gid` is checked per request). `app.mcp.token` stays the
   manual path for CI and scripts.
-- Tracing is native (`src/telemetry/`): `app.tracer.span(name, attrs, fn)` for consumer work; requests, cron runs, SQL,
-  tx, hooks, CRUD, batch, realtime, mail, notifications and `app.tracer.fetch` are traced on their own. Spans go to
-  `_spans` in the auxiliary db; read them in tests with `collectSpans(app)`.
+- Background work is one queue (`src/queue/`, `_jobs` in the data db): `app.queue.define` a job in the setup module
+  (`createCli({ setup: URL })`, `defineSetup`), `schedule` it (a schedule only enqueues, never over a pending or running
+  run), `enqueue` it (inside a store tx it is part of it) or `run` it (waits). Jobs run in executor subprocesses claimed
+  by a supervisor (a thread of `serve`, or `worker` processes on the same file); `heavy` jobs (backup, files migration)
+  get a process each and never take a normal slot. Long services are `src/services/` (no queue in it):
+  `service<M>(name)`, `provide` on the serve (supervisord-like states, singleton lease, `/api/services`; the scheduler
+  is one). A call from another process is one direct request over the serve's Unix socket: no retry, nothing kept;
+  `service_unavailable` / `service_deadline` / `service_outcome_unknown` / `service_call_in_tx`. A service with an
+  external effect deduplicates by `currentCall().idem` (the same on a job's retry). No `setTimeout` or thread of its own
+  for background work: give it a job. In memory or a bare `createApp`, jobs run inline; tests `await app.queue.drain()`;
+  process tests are in `src/queue/process_test.ts`.
+- Tracing is native (`src/telemetry/`): `app.tracer.span(name, attrs, fn)` for consumer work; requests, job runs
+  (`cron
+  <id>` / `job <name>`), SQL, tx, hooks, CRUD, batch, realtime, mail, notifications and `app.tracer.fetch` are
+  traced on their own. Spans go to `_spans` in the auxiliary db; read them in tests with `collectSpans(app)`.
 - REST and realtime must stay 1:1 with PocketBase; check behaviour in the upstream source
   (github.com/pocketbase/pocketbase, pinned at v0.39.10).
 - Public API is `mod.ts`; test helpers are `@denobase/denobase/testing` (consumers import the package under the bare key

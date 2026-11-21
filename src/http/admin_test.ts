@@ -146,24 +146,26 @@ Deno.test("cron: PB expressions and macros, UTC schedule, jobs API", async () =>
 
   const t = await setup();
   let ran = 0;
-  t.app.cron.add("relatorio", "0 0 * * *", () => void ran++);
+  t.app.queue.define("relatorio", () => void ran++);
+  t.app.queue.schedule("relatorio", "0 0 * * *", "relatorio");
   const jobs = (await t.call("GET", "/api/crons")).json;
+  // The WAL checkpoints are not jobs (the serve's scheduler runs them): they are not listed.
   assertEquals(jobs.map((j: { id: string }) => j.id), [
     "relatorio",
     "__denobaseOAuthCleanup__",
+    "__denobaseQueueCleanup__",
     "__denobaseTracesCleanup__",
-    "__denobaseWalCheckpoint__",
-    "__denobaseWalTruncate__",
     "__pbDBOptimize__",
     "__pbLogsCleanup__",
     "__pbOTPCleanup__",
   ]);
   assertEquals(jobs[0], { id: "relatorio", expression: "0 0 * * *" });
   assertEquals((await t.call("POST", "/api/crons/relatorio")).status, 204);
-  await new Promise((r) => setTimeout(r, 0));
+  await t.app.queue.drain();
   assertEquals(ran, 1);
   assertEquals((await t.call("POST", "/api/crons/nope")).json.message, "Missing or invalid cron job");
-  await t.app.cron.tick(new Date("2026-10-04T00:00:00Z"));
+  await t.app.queue.tick(new Date("2026-10-04T00:00:00Z"));
+  await t.app.queue.drain();
   assertEquals(ran, 2);
 });
 

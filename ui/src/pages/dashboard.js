@@ -273,9 +273,9 @@ function kpiRow(traffic, jobs, attn) {
       delta(f.current, f.previous || f.current ? f.previous : null, { higherIsBad: true }),
       sparkline(fhours.map((h) => h.failed), "bad"),
       {
-        href: tracesHref('status=2&&(name~"cron "||name="mail.send")'),
+        href: "#/queue?status=failed",
         alert: attn.items.some((i) => i.severity === "error" && /^(cron:|mail:|notifications:)/.test(i.id)),
-        tip: "Cron runs, emails and notifications",
+        tip: "Queue jobs that failed for good, emails and notifications",
       },
     ),
   );

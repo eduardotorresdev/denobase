@@ -1,3 +1,6 @@
+import { MARKER } from "../queue/restore_marker.ts";
+import { SOCKET_PREFIX } from "../services/socket.ts";
+
 /** Where restore stages and parks files; PB's LocalTempDirName. */
 export const TRASH_DIR = ".pb_temp_to_delete";
 
@@ -9,7 +12,8 @@ export async function swapDataDir(dataDir: string, extractedDir: string, id: num
   const old = `${dataDir}/${TRASH_DIR}/pb_old_${id}`;
   await Deno.mkdir(old, { recursive: true });
   for await (const e of Deno.readDir(dataDir)) {
-    if (e.name === "backups" || e.name === TRASH_DIR) continue;
+    // The restore marker stays: a node starting mid-swap must still see it (§16 N6).
+    if (e.name === "backups" || e.name === TRASH_DIR || e.name === MARKER || e.name.startsWith(SOCKET_PREFIX)) continue;
     await Deno.rename(`${dataDir}/${e.name}`, `${old}/${e.name}`);
   }
   for await (const e of Deno.readDir(extractedDir)) {

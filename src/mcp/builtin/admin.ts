@@ -5,6 +5,7 @@ import { guardedQuery, SqlRejected } from "../../sql/guard.ts";
 import { setAuthorizer, SQLITE_OK, SQLITE_READ } from "../../sql/sqlite_ext.ts";
 import { ReadOnlySqlError, selectRows } from "../../sql/read.ts";
 import { dbPath } from "../../workers/mod.ts";
+import { backupInUse, createBackup, cronList, restoreBackup } from "../../backups/ops.ts";
 import { backupName, type Backups, validKey } from "../../backups/mod.ts";
 import { mergeSettings, publicSettings, saveSettings, type Settings, validateSettings } from "../../settings/mod.ts";
 import { LEVEL } from "../../logs/mod.ts";
@@ -118,7 +119,8 @@ export function adminTools(host: McpHost, p: string): void {
     visibility: su,
     annotations: { readOnly: true, idempotent: true },
     input: z.object({}),
-    handler: () => Promise.resolve({ items: app().cron.jobs().map((j) => ({ id: j.id, expression: j.expression })) }),
+    handler: () =>
+      Promise.resolve({ items: cronList(app().queue).map((j) => ({ id: j.id, expression: j.expression })) }),
   });
 
   host.tool({
@@ -128,11 +130,9 @@ export function adminTools(host: McpHost, p: string): void {
     visibility: su,
     annotations: { destructive: false, openWorld: true },
     input: z.object({ id: z.string().min(1) }),
-    handler: (a) => {
-      const job = app().cron.get(a.id);
-      if (!job) throw notFound("Missing or invalid cron job");
-      void job.run("manual");
-      return Promise.resolve({ started: a.id });
+    handler: async (a) => {
+      const job = await app().queue.runNow(a.id);
+      return { started: a.id, job: job.id };
     },
   });
 
@@ -159,10 +159,9 @@ export function adminTools(host: McpHost, p: string): void {
     input: z.object({ name: z.string().regex(/^[a-z0-9_-]{1,145}\.zip$/).optional() }),
     handler: async (a) => {
       const b = backups();
-      if (b.active) throw badRequest("Try again later - another backup/restore process has already been started");
       const name = a.name ?? backupName(app().settings.meta.appName, "pb_backup_");
       if (await b.exists(name)) throw badRequest("The backup file name is invalid or already exists.");
-      await b.create(name);
+      await createBackup(app().queue, name);
       return { created: name };
     },
   });
@@ -176,10 +175,9 @@ export function adminTools(host: McpHost, p: string): void {
     input: z.object({ key: z.string().min(1) }),
     handler: async (a) => {
       const b = backups();
-      if (b.active) throw badRequest("Try again later - another backup/restore process has already been started.");
       if (!validKey(a.key) || !(await b.exists(a.key))) throw badRequest("Missing or invalid backup file.");
-      // Like the REST route: answer first, restore a second later (the restore restarts the process).
-      setTimeout(() => b.restore(a.key).catch((e) => console.error("Failed to restore backup", a.key, e)), 1000);
+      // Like the REST route: answer first; the serve restores in the background (and restarts).
+      await restoreBackup(app().queue, b, a.key);
       return { restoring: a.key };
     },
   });
@@ -193,7 +191,9 @@ export function adminTools(host: McpHost, p: string): void {
     input: z.object({ key: z.string().min(1) }),
     handler: async (a) => {
       const b = backups();
-      if (b.active === a.key) throw badRequest("The backup is currently being used and cannot be deleted.");
+      if (backupInUse(app().queue, a.key)) {
+        throw badRequest("The backup is currently being used and cannot be deleted.");
+      }
       if (!validKey(a.key) || !(await b.exists(a.key))) throw badRequest("Invalid or already deleted backup file.");
       await b.delete(a.key);
       return { deleted: a.key };

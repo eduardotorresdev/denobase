@@ -109,5 +109,7 @@ function run(r: GuardRequest): GuardResponse {
 }
 
 self.onmessage = (e: MessageEvent<GuardRequest>) => {
+  // The query starts now: the caller's timeout counts from here, not from the worker's start-up.
+  self.postMessage({ started: true });
   self.postMessage(run(e.data));
 };

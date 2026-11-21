@@ -87,6 +87,8 @@ interface Frame {
 
 /** The tx frame the current async context runs inside; nested tx() calls see it here. */
 const inTx = new AsyncLocalStorage<Frame>();
+/** Every connection whose transaction the caller runs inside (a frame knows only its own db). */
+const held = new AsyncLocalStorage<ReadonlySet<DatabaseSync>>();
 /** Tail of the queue of top-level txs per connection: one shared DatabaseSync can hold only one transaction. */
 const queues = new WeakMap<DatabaseSync, Promise<unknown>>();
 
@@ -191,12 +193,16 @@ async function run<T>(
   if (!nested) syncExternalCommits(db);
   let out: T;
   try {
-    out = await inTx.run(frame, async () => {
-      const r = await fn(db);
-      // The outermost level flushes its queued work while the transaction is still open.
-      if (!frame.root) await drainBeforeCommit(frame);
-      return r;
-    });
+    const holding = new Set(held.getStore() ?? []).add(db);
+    out = await held.run(holding, () =>
+      inTx.run(frame, async () => {
+        if (!nested) beginGuard?.(db);
+        const r = await fn(db);
+        // The outermost level flushes its queued work while the transaction is still open.
+        if (!frame.root) await drainBeforeCommit(frame);
+        if (!nested && commitGuard) await commitGuard(db);
+        return r;
+      }));
     db.exec(nested ? `RELEASE ${sp}` : "COMMIT");
   } catch (e) {
     try {
@@ -215,6 +221,42 @@ async function run<T>(
     for (const f of frame.afterCommit) f();
   }
   return out;
+}
+
+/** Whether the caller runs inside a transaction (any level) on db. */
+export function inTransaction(db: DatabaseSync): boolean {
+  return inTx.getStore()?.db === db;
+}
+
+/** Whether the caller runs inside a transaction of db at any depth, under transactions of other connections too. */
+export function holdsTransaction(db: DatabaseSync): boolean {
+  return held.getStore()?.has(db) ?? false;
+}
+
+/** Whether the caller runs inside a transaction on any connection. */
+export function inAnyTransaction(): boolean {
+  return inTx.getStore() !== undefined;
+}
+
+/**
+ * Runs right before the outermost level of every transaction commits, on every connection; throwing rolls it back.
+ * The queue's fence: a job that lost its lease cannot commit (see src/queue/fence.ts). One guard per process.
+ */
+type CommitGuard = (db: DatabaseSync) => void | Promise<void>;
+let commitGuard: CommitGuard | undefined;
+
+export function setCommitGuard(fn: CommitGuard | undefined): void {
+  commitGuard = fn;
+}
+
+/**
+ * Runs right after the outermost BEGIN, inside it: the queue renews a job's lease there too (a transaction longer
+ * than the lease would otherwise fail at every try). Throwing rolls it back.
+ */
+let beginGuard: ((db: DatabaseSync) => void) | undefined;
+
+export function setBeginGuard(fn: ((db: DatabaseSync) => void) | undefined): void {
+  beginGuard = fn;
 }
 
 /** PB-style 15-char lowercase alnum id. */

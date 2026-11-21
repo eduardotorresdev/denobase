@@ -34,8 +34,20 @@ export const notificationsCollection = defineCollection({
     { name: "error", type: "text", maxLength: 2000 },
     { name: "attempts", type: "number", integer: true, min: 0 },
     { name: "externalId", type: "text" },
+    /** The service call's content key (a job's send): a retried job finds its row instead of sending twice. */
+    { name: "idem", type: "text", maxLength: 512 },
+    /**
+     * A queued row being sent: by whom (a process's token) and until when (ms). Taken in one IMMEDIATE transaction,
+     * so two serves retrying the same call never both send; a lapsed one (its serve died) may be taken over.
+     */
+    { name: "sender", type: "text", maxLength: 64 },
+    { name: "sendUntil", type: "number", integer: true, min: 0 },
   ],
-  indexes: [{ fields: ["provider", "externalId"] }, { fields: ["status"] }],
+  indexes: [
+    { fields: ["provider", "externalId"] },
+    { fields: ["status"] },
+    { fields: ["idem"], unique: true, where: "idem != ''" },
+  ],
   access: denyAll,
 });
 

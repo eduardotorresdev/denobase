@@ -38,7 +38,8 @@ Deno.test("admin: settings never carry secrets; a patch is validated and saved",
 Deno.test("admin: crons list and run; logs list and stats", async () => {
   const t = await fixture();
   let ran = 0;
-  t.app.cron.add("mt_job", "0 0 * * *", () => void ran++);
+  t.app.queue.define("mt_job", () => void ran++);
+  t.app.queue.schedule("mt_job", "0 0 * * *", "mt_job");
   const c = await connect(t.app, t.suToken);
   const jobs = structured(await c.callTool({ name: "db_crons_list", arguments: {} }));
   assert((jobs.items as { id: string }[]).some((j) => j.id === "mt_job"));

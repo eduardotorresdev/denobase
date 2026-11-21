@@ -1,14 +1,14 @@
 import type { DatabaseSync } from "node:sqlite";
-import { inJobWorker } from "../../jobs/on_main.ts";
+import { inExecutor } from "../../queue/context.ts";
 
 /** Rows per DELETE in the cleanup jobs: each is its own short write transaction. */
 export const CLEANUP_BATCH = 500;
 
 /**
- * The pause between batches. In the job worker it lasts longer than SQLite's busy-handler naps, so a writer on another
+ * The pause between batches. In an executor it lasts longer than SQLite's busy-handler naps, so a writer on another
  * thread waiting for the lock gets it instead of the next batch; inline it only yields the loop.
  */
-const yieldLoop = () => new Promise<void>((r) => setTimeout(r, inJobWorker() ? GAP_IN_WORKER_MS : 0));
+const yieldLoop = () => new Promise<void>((r) => setTimeout(r, inExecutor() ? GAP_IN_WORKER_MS : 0));
 
 /** Longer than the busy handler's 25 ms naps. */
 export const GAP_IN_WORKER_MS = 30;

@@ -4,6 +4,9 @@ import { requireSuperuser } from "./guards.ts";
 import { stamp } from "../core/time.ts";
 import { selectRows } from "../sql/read.ts";
 import { statsPayload } from "./stats.ts";
+import { cronList } from "../backups/ops.ts";
+import { scheduleDay, toRow } from "../queue/table.ts";
+import type { JobRow } from "../queue/types.ts";
 
 /**
  * The admin home's reads (Denobase-only; PB has no dashboard), one endpoint per card so a slow one never holds the
@@ -39,42 +42,50 @@ export function tracesPayload(ctx: Ctx) {
   return { ...ctx.traces.overview(now), slowMs, problems: ctx.traces.problems(new Date(now.getTime() - DAY), slowMs) };
 }
 
-type Run = { status: "ok" | "error"; at: string; duration: number; traceId: string };
+type Run = { status: "ok" | "error"; at: string; duration: number; traceId: string; job: string };
 type CronRuns = { last: Run | null; runs24h: number; failed24h: number; lastFailure: Run | null };
 
-const toRun = (r: Record<string, unknown> | undefined): Run | null =>
-  r
+const toRun = (j: JobRow | undefined): Run | null =>
+  j
     ? {
-      status: Number(r.status) === 2 ? "error" : "ok",
-      at: String(r.created),
-      duration: Number(r.duration),
-      traceId: String(r.traceId),
+      status: j.status === "failed" ? "error" : "ok",
+      at: new Date(j.started ?? j.created).toISOString().replace("T", " "),
+      duration: j.finished && j.started ? j.finished - j.started : 0,
+      traceId: j.traceId ?? "",
+      job: j.id,
     }
     : null;
 
 /**
- * A cron job's stored runs: its `cron <id>` roots (cron runs are always kept, whatever the sampling). The last run,
- * and the day's runs and failures, so a job that fails now and then stays visible after a good run. `+root` keeps
- * the planner on (name, created): walking the root index backwards took 100ms+ per job.
+ * A schedule's runs, from _jobs (§9): the last finished one, and the day's runs and failures, so a job that fails
+ * now and then stays visible after a good run.
  */
-function cronRuns(ctx: Ctx, id: string, since: string): CronRuns {
-  const name = `cron ${id}`;
-  const db = ctx.traces.db;
-  const cols = `status, created, duration, "traceId"`;
-  const last = db.prepare(`SELECT ${cols} FROM "_spans" WHERE name = ? AND +root = 1 ORDER BY created DESC LIMIT 1`)
-    .get(name) as Record<string, unknown> | undefined;
-  const day = db.prepare(
-    `SELECT COUNT(*) AS n, COALESCE(SUM(status = 2), 0) AS f FROM "_spans" WHERE name = ? AND +root = 1 AND created >= ?`,
-  ).get(name, since) as { n: number; f: number };
-  const failed24h = Number(day.f);
-  const lastFailure = failed24h
-    ? toRun(
-      db.prepare(
-        `SELECT ${cols} FROM "_spans" WHERE name = ? AND +root = 1 AND +status = 2 ORDER BY created DESC LIMIT 1`,
-      ).get(name) as Record<string, unknown>,
-    )
-    : null;
-  return { last: toRun(last), runs24h: Number(day.n), failed24h, lastFailure };
+function cronRuns(ctx: Ctx, id: string): CronRuns & { running: boolean; pending: boolean } {
+  const db = ctx.db;
+  const since = Date.now() - DAY;
+  const day = scheduleDay(db, id, since);
+  const last = db.prepare(
+    `SELECT * FROM _jobs WHERE schedule = ? AND status IN ('done', 'failed') ORDER BY finished DESC LIMIT 1`,
+  ).get(id) as Record<string, unknown> | undefined;
+  const fail = day.failed
+    ? db.prepare(`SELECT * FROM _jobs WHERE schedule = ? AND status = 'failed' ORDER BY finished DESC LIMIT 1`).get(
+      id,
+    ) as
+      | Record<string, unknown>
+      | undefined
+    : undefined;
+  const active = db.prepare(
+    `SELECT COALESCE(SUM(status = 'running'), 0) AS r, COALESCE(SUM(status = 'pending'), 0) AS p FROM _jobs
+     WHERE schedule = ? AND status IN ('pending', 'running')`,
+  ).get(id) as { r: number; p: number };
+  return {
+    last: toRun(last && toRow(last)),
+    runs24h: day.runs,
+    failed24h: day.failed,
+    lastFailure: toRun(fail && toRow(fail)),
+    running: Number(active.r) > 0,
+    pending: Number(active.p) > 0,
+  };
 }
 
 const AUTO_BACKUP = "__pbAutoBackup__";
@@ -82,12 +93,11 @@ const AUTO_BACKUP = "__pbAutoBackup__";
 export async function jobsPayload(ctx: Ctx) {
   const now = Date.now();
   const since = stamp(new Date(now - DAY));
-  const crons = ctx.cron.jobs().map((j) => ({
+  const crons = cronList(ctx.queue).map((j) => ({
     id: j.id,
     expression: j.expression,
     system: j.id.startsWith("__"),
-    running: j.running,
-    ...cronRuns(ctx, j.id, since),
+    ...cronRuns(ctx, j.id),
   }));
   let backup: { key: string; size: number; modified: string } | null = null;
   if (ctx.backups) {
@@ -118,17 +128,20 @@ export async function jobsPayload(ctx: Ctx) {
 }
 
 /**
- * Work outside HTTP that failed (cron runs, mail, notifications): this day against the one before, and per hour,
+ * Work outside HTTP that failed (queue jobs, mail, notifications): this day against the one before, and per hour,
  * for the home's "Failed jobs" figure, which the request figures do not cover.
  */
 function failedJobs(ctx: Ctx, now: number, mail: { hour: string; n: number }[]) {
   const mid = stamp(new Date(now - DAY)).slice(0, 13);
-  const cron = cached(ctx, "traces", () => tracesPayload(ctx)).cronFailed;
+  // Jobs of the queue (§9): what failed for good, by the hour it ended; the same count as the Queue page's failed tab.
+  const jobs = ctx.db.prepare(
+    `SELECT strftime('%Y-%m-%d %H', finished / 1000, 'unixepoch') AS hour, COUNT(*) AS n FROM _jobs
+     WHERE status = 'failed' AND finished >= ? GROUP BY hour`,
+  ).all(now - 2 * DAY) as { hour: string; n: number }[];
   const byHour = new Map<string, number>();
-  let current = cron.current, previous = cron.previous;
-  for (const h of cron.hours) byHour.set(h.date.slice(0, 13), h.failed);
+  let current = 0, previous = 0;
   const notif = notificationsFailedByHour(ctx, stamp(new Date(now - 2 * DAY)));
-  for (const r of [...mail, ...notif]) {
+  for (const r of [...jobs, ...mail, ...notif]) {
     if (r.hour < mid) {
       previous += Number(r.n);
       continue;
@@ -204,7 +217,7 @@ export async function attentionPayload(ctx: Ctx): Promise<{ checked: string; ite
       title: `${j.id} failed ${j.failed24h}/${j.runs24h}`,
       detail: failing ? `Last run failed · ${runs}` : `Recovered · ${runs}`,
       at: j.lastFailure.at,
-      href: `#/traces/${j.lastFailure.traceId}`,
+      href: j.lastFailure.traceId ? `#/traces/${j.lastFailure.traceId}` : `#/queue/${j.lastFailure.job}`,
     });
   }
   if (jobs.backup.enabled) {

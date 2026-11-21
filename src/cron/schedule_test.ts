@@ -1,5 +1,6 @@
 import { assert, assertEquals } from "@std/assert";
-import { Cron } from "./cron.ts";
+import { createApp } from "../app.ts";
+import { openDb } from "../core/db.ts";
 import { isTimeZone, Schedule } from "./schedule.ts";
 
 Deno.test("schedule matches the wall clock of the given timezone", () => {
@@ -15,15 +16,17 @@ Deno.test("day of week follows the timezone across midnight", () => {
   assert(s.isDue(new Date("2026-10-06T01:30:00Z"), "America/Sao_Paulo")); // Tuesday 01:30Z
 });
 
-Deno.test("cron ticks in the timezone it reads at each tick", async () => {
-  let tz = "UTC";
-  const cron = new Cron(() => tz);
+Deno.test("the scheduler ticks in the timezone it reads at each tick", async () => {
+  const app = createApp({ db: openDb() });
   let runs = 0;
-  cron.add("job", "0 2 * * *", () => runs++);
+  app.queue.define("job", () => void runs++);
+  app.queue.schedule("job", "0 2 * * *", "job");
   const at = new Date("2026-10-06T05:00:00Z");
-  await cron.tick(at);
-  tz = "America/Sao_Paulo";
-  await cron.tick(at);
+  await app.queue.tick(at);
+  await app.queue.drain();
+  app.settings.meta.timezone = "America/Sao_Paulo";
+  await app.queue.tick(at);
+  await app.queue.drain();
   assertEquals(runs, 1);
 });
 

@@ -52,7 +52,6 @@ export interface MigrationState {
 export const FILES_MIGRATION_TOPIC = "_denobase/files-migration";
 
 /** How long a run owns a job without renewing; a crashed process frees it after this. */
-const LEASE_MS = 30_000;
 /** Kept in the row; the counter still says how many failed. */
 const MAX_FAILURES = 200;
 /** Progress is persisted after every key but published at most this often. */
@@ -210,7 +209,7 @@ interface Row {
   finished: string;
 }
 
-function toState(r: Row): MigrationState {
+function toState(r: Row, owned: (id: string) => boolean): MigrationState {
   return {
     id: r.id,
     status: r.status,
@@ -226,7 +225,7 @@ function toState(r: Row): MigrationState {
     cursor: r.cursor,
     failures: JSON.parse(r.failures),
     error: r.error,
-    stalled: r.status === "running" && r.leaseUntil < Date.now(),
+    stalled: r.status === "running" && !owned(r.id),
     created: r.created,
     updated: r.updated,
     finished: r.finished,
@@ -260,8 +259,11 @@ export interface RunDeps {
   s3: S3Config | (() => S3Config);
   /** Called with every (throttled) progress update and the final state. */
   progress?: (s: MigrationState) => unknown;
-  /** Who runs it; a lease held by another owner and not expired makes this run return without work. */
+  /** Who runs it; another run that takes the row over (its owner changes) makes this one step back. */
   owner?: string;
+  /** The queue job's signal: aborted when its lease is lost, it is canceled or timed out. The queue job is the only
+   * lease (R8): one runs per migration (its dedupe key), a dead one is taken over by the queue. */
+  signal?: AbortSignal;
 }
 
 /** The source as a BlobStore. */
@@ -285,24 +287,13 @@ export async function runMigration(id: string, deps: RunDeps): Promise<boolean> 
   const { aux } = deps;
   ensureMigrationTable(aux);
   const owner = deps.owner ?? crypto.randomUUID();
-  const claim = () =>
-    aux.prepare(
-      `UPDATE _files_migrations SET owner = ?, leaseUntil = ? WHERE id = ? AND status = 'running'
-       AND (owner = ? OR leaseUntil < ?)`,
-    ).run(owner, Date.now() + LEASE_MS, id, owner, Date.now()).changes > 0;
-  if (!claim()) return false;
+  if (
+    aux.prepare(`UPDATE _files_migrations SET owner = ? WHERE id = ? AND status = 'running'`).run(owner, id).changes ===
+      0
+  ) {
+    return false;
+  }
   const currentS3 = () => (typeof deps.s3 === "function" ? deps.s3() : deps.s3);
-  // Renewed on a timer, not only per key: a long listing, one big put or the delete phase outlive LEASE_MS, and a
-  // lapsed lease lets a second run take the job over while this one still works.
-  const renew = aux.prepare(
-    `UPDATE _files_migrations SET leaseUntil = ? WHERE id = ? AND owner = ? AND status = 'running'`,
-  );
-  let lost = false;
-  const heartbeat = setInterval(() => {
-    try {
-      if (renew.run(Date.now() + LEASE_MS, id, owner).changes === 0) lost = true;
-    } catch { /* a busy db: the next beat or key renews it */ }
-  }, LEASE_MS / 3);
 
   let r = row(aux, id)!;
   let lastPublish = 0;
@@ -310,14 +301,14 @@ export async function runMigration(id: string, deps: RunDeps): Promise<boolean> 
     if (!deps.progress || (!force && Date.now() - lastPublish < PUBLISH_MS)) return;
     lastPublish = Date.now();
     try {
-      await deps.progress(toState(row(aux, id)!));
+      await deps.progress(toState(row(aux, id)!, () => true));
     } catch {
       // Progress is a courtesy to the UI; the job's state is in the db either way.
     }
   };
   const finish = async (status: MigrationStatus, error = "") => {
     aux.prepare(
-      `UPDATE _files_migrations SET status = ?, error = ?, finished = ?, updated = ?, leaseUntil = 0
+      `UPDATE _files_migrations SET status = ?, error = ?, finished = ?, updated = ?
        WHERE id = ? AND status = 'running' AND owner = ?`,
     ).run(status, error, nowStamp(), nowStamp(), id, owner);
     await publish(true);
@@ -333,7 +324,7 @@ export async function runMigration(id: string, deps: RunDeps): Promise<boolean> 
   /** Canceled, or taken over by another run: stop without touching the row. */
   const stillMine = () => {
     const now = statusOf.get(id) as { status: string; owner: string };
-    return !lost && now.status === "running" && now.owner === owner;
+    return !deps.signal?.aborted && now.status === "running" && now.owner === owner;
   };
 
   try {
@@ -347,7 +338,7 @@ export async function runMigration(id: string, deps: RunDeps): Promise<boolean> 
     const failures: MigrationFailure[] = JSON.parse(r.failures);
     const save = aux.prepare(
       `UPDATE _files_migrations SET cursor = ?, processed = processed + 1, copied = copied + ?, skipped = skipped + ?,
-       failed = failed + ?, bytes = bytes + ?, failures = ?, updated = ?, leaseUntil = ? WHERE id = ? AND owner = ?`,
+       failed = failed + ?, bytes = bytes + ?, failures = ?, updated = ? WHERE id = ? AND owner = ?`,
     );
     for (const { key, size } of keys) {
       if (r.cursor && key <= r.cursor) continue;
@@ -380,7 +371,6 @@ export async function runMigration(id: string, deps: RunDeps): Promise<boolean> 
         bytes,
         JSON.stringify(failures),
         nowStamp(),
-        Date.now() + LEASE_MS,
         id,
         owner,
       );
@@ -408,8 +398,6 @@ export async function runMigration(id: string, deps: RunDeps): Promise<boolean> 
     await finish("done");
   } catch (e) {
     await finish("failed", (e as Error).message);
-  } finally {
-    clearInterval(heartbeat);
   }
   return true;
 }
@@ -446,6 +434,8 @@ export interface FilesMigrationsDeps {
   s3: () => S3Config;
   /** Starts the run somewhere (the job worker in the app); rejects only on a crash the run could not record. */
   launch: (id: string) => Promise<unknown>;
+  /** Whether a queue job is pending or running for migration id: a running row without one is stalled. */
+  owned?: (id: string) => boolean;
 }
 
 /**
@@ -460,18 +450,18 @@ export class FilesMigrations {
   /** The most recent job (or proposal); null when there was never one. */
   status(): MigrationState | null {
     const r = latest(this.deps.aux);
-    return r ? toState(r) : null;
+    return r ? toState(r, (id) => this.#owned(id)) : null;
   }
 
   /** The running job, stalled or not. */
   active(): MigrationState | null {
     const r = latest(this.deps.aux, `status = 'running'`);
-    return r ? toState(r) : null;
+    return r ? toState(r, (id) => this.#owned(id)) : null;
   }
 
   get(id: string): MigrationState | null {
     const r = row(this.deps.aux, id);
-    return r ? toState(r) : null;
+    return r ? toState(r, (id) => this.#owned(id)) : null;
   }
 
   /** settings.s3 went from prev to next: keep prev (sealed) as the proposal, replacing an older one. */
@@ -563,7 +553,7 @@ export class FilesMigrations {
     const r = latest(aux, `status IN ('running', 'failed', 'canceled')`);
     if (!r) throw stableError(404, "files_migration_not_found", "There is no files migration to resume.");
     if (r.status === "running") {
-      if (r.leaseUntil >= Date.now()) throw active();
+      if (this.#owned(r.id)) throw active();
     } else {
       if (this.active()) throw active();
       const target = storageLabel(this.deps.s3());
@@ -594,7 +584,7 @@ export class FilesMigrations {
     const r = latest(this.deps.aux, `status = 'running'`);
     if (!r) throw stableError(404, "files_migration_not_found", "There is no running files migration.");
     this.deps.aux.prepare(
-      `UPDATE _files_migrations SET status = 'canceled', finished = ?, updated = ?, leaseUntil = 0 WHERE id = ?`,
+      `UPDATE _files_migrations SET status = 'canceled', finished = ?, updated = ? WHERE id = ?`,
     ).run(nowStamp(), nowStamp(), r.id);
     return this.get(r.id)!;
   }
@@ -602,9 +592,13 @@ export class FilesMigrations {
   /** The run in flight from this process, for tests and shutdown. */
   running: Promise<unknown> = Promise.resolve();
 
+  #owned(id: string): boolean {
+    return this.deps.owned?.(id) ?? false;
+  }
+
   #launch(id: string): void {
     this.running = this.deps.launch(id).catch((e) => {
-      // A crashed worker leaves the row running with a lease that expires: resume takes it over then.
+      // A crashed run leaves the row running; its queue job retries it, or resume does once no job holds it.
       console.error(`files migration ${id}:`, (e as Error).message);
     });
   }

@@ -5,8 +5,8 @@ import { RequestStats } from "./telemetry/requests.ts";
 import { Spans } from "./telemetry/store.ts";
 import { Tracer } from "./telemetry/tracer.ts";
 import type { Attrs } from "./telemetry/span.ts";
-import { Cron, systemJobs } from "./cron/mod.ts";
-import { autoBackups, Backups } from "./backups/mod.ts";
+import { systemJobs } from "./cron/mod.ts";
+import { autoBackups, backupJobs, Backups } from "./backups/mod.ts";
 import type { Hono } from "hono";
 import { type Mailer, mailerFromEnv } from "./auth/mailer.ts";
 import type { CollectionConfig } from "./core/types.ts";
@@ -17,16 +17,22 @@ import { Realtime } from "./realtime/mod.ts";
 import { createStore, type Store } from "./store/mod.ts";
 import { type BlobStore, MemoryStorage } from "./files/storage.ts";
 import { CurrentStorage } from "./files/current.ts";
-import { FILES_MIGRATION_TOPIC, FilesMigrations } from "./files/migrate.ts";
-import { PROGRESS_OP } from "./files/tasks/migrate.ts";
+import { FilesMigrations } from "./files/migrate.ts";
+import { FILES_MIGRATION_JOB, filesMigrationJob } from "./files/tasks/migrate.ts";
 import { loadSettings, resolveSettings, type Settings, type SettingsPatch } from "./settings/mod.ts";
 import { bundledUi, diskUi } from "./http/ui_source.ts";
 import { McpHost } from "./mcp/host.ts";
 import { PathRedactor } from "./http/redact_path.ts";
-import { JobRunner } from "./jobs/runner.ts";
+import { Queue, type QueueOptions } from "./queue/queue.ts";
+import { ServiceManager } from "./services/manager.ts";
+import { ensureServiceTables } from "./services/table.ts";
+import { setAmbientApp } from "./services/handle.ts";
+import { runningJob } from "./queue/context.ts";
+import { ensureJobsTable } from "./queue/table.ts";
+import { ensureNodeTables } from "./queue/nodes.ts";
 import { onExternalCommit, syncExternalCommits } from "./core/coherence.ts";
 import { shareRecordEvents } from "./engine/bus.ts";
-import { dbPath, runTask } from "./workers/mod.ts";
+import { dbPath } from "./workers/mod.ts";
 import type { Mcp, McpOptions } from "./mcp/types.ts";
 
 export interface AppOptions {
@@ -51,6 +57,35 @@ export interface AppOptions {
   settings?: SettingsPatch;
   /** The native MCP server (POST /api/mcp, `mcp` CLI command); on by default. */
   mcp?: McpOptions;
+  /**
+   * The module that sets the app up in every process (serve, worker executors, mcp): its default export
+   * (defineSetup) defines jobs and schedules, registers hooks. A URL, since executors import it themselves.
+   */
+  setup?: URL | string;
+  /** Which process this app is (createCli sets it): an executor or a worker never starts long services. */
+  role?: AppRole;
+  /** The queue's retention. */
+  queue?: QueueOptions;
+}
+
+export type AppRole = "app" | "serve" | "worker" | "executor" | "mcp";
+
+/** A setup module's default export: what every process's app needs (jobs, schedules, hooks, services' handles). */
+export type Setup = (app: App) => unknown;
+
+/** Types a setup module's default export. */
+export function defineSetup(fn: Setup): Setup {
+  return fn;
+}
+
+const setupLoaded = new WeakSet<App>();
+
+/** Imports app.setup and runs its default export on app, once. serve, worker executors and mcp call it. */
+export async function loadSetup(app: App): Promise<void> {
+  if (!app.setup || setupLoaded.has(app)) return;
+  setupLoaded.add(app);
+  const mod = await import(app.setup);
+  if (typeof mod.default === "function") await (mod.default as Setup)(app);
 }
 
 /**
@@ -69,13 +104,16 @@ export interface App {
   readonly tracer: Tracer;
   /** The stored traces (_spans in the auxiliary db): list, view, stats, truncate. */
   readonly traces: Spans;
-  /** Jobs ticking once serve starts it (PB app.Cron()); consumers add theirs in beforeServe, with addJob. */
-  readonly cron: Cron;
   /**
-   * The job worker every cron job and backup runs in: consumers point it at their bootstrap (use) and declare the
-   * main-thread operations jobs call (operation, onMain). The main thread applies every write the jobs send.
+   * The one queue every background job goes through (_jobs, data db): define, schedule, enqueue, run, the admin's
+   * actions. On a file db supervisors and executors run the jobs; in memory they run inline after the commit.
    */
-  readonly jobs: JobRunner;
+  readonly queue: Queue;
+  /** The long services this process provides (serve only): WhatsApp sessions, MQTT clients. See `service()`. */
+  readonly services: ServiceManager;
+  /** The setup module's URL (AppOptions.setup). */
+  readonly setup?: string;
+  readonly role: AppRole;
   readonly backups: Backups | null;
   /** Moving record files to the storage settings.s3 names now (job state in the auxiliary db). */
   readonly filesMigration: FilesMigrations;
@@ -130,37 +168,47 @@ export function createApp(opts: AppOptions): App {
   const traces = new Spans(logs.db);
   const requests = new RequestStats(logs.db);
   const tracer = new Tracer(traces, () => settings.traces);
-  const jobs = new JobRunner({ app: () => app, db, auxDb: logs.db, store, tracer });
-  const backups = opts.dataDir
-    ? new Backups(
-      opts.dataDir,
-      db,
-      logs.db,
-      opts.onRestored ?? (() => {}),
-      // With the jobs inline (rollback flag) a backup still never runs on the main thread: a worker of its own.
-      (module, input) => jobs.inWorker ? jobs.run({ module }, input) : runTask(module, input),
-    )
-    : null;
+  const role: AppRole = opts.role ?? "app";
+  ensureJobsTable(db);
+  ensureNodeTables(logs.db);
+  ensureServiceTables(logs.db);
+  const queue = new Queue({ app: () => app, db, aux: logs.db, role: () => role }, opts.queue);
+  const services = new ServiceManager({
+    app: () => app,
+    aux: () => logs.db,
+    role: () => role,
+    node: () => queue.nodeId,
+    shared: () => queue.distributed && role !== "app",
+    job: () => {
+      const j = runningJob();
+      return j ? { id: j.owner.id, calls: j.calls, signal: j.ctx.signal } : undefined;
+    },
+  });
+  setAmbientApp(() => runningJob()?.ctx.app);
+  const backups = opts.dataDir ? new Backups(opts.dataDir, db, logs.db, opts.onRestored ?? (() => {})) : null;
   const filesMigration = new FilesMigrations({
     aux: logs.db,
     data: db,
     storage: files,
     s3: () => settings.s3,
-    launch: (id) => jobs.run({ module: MIGRATE_TASK }, { id }),
+    launch: async (id) => {
+      const row = await queue.enqueue(FILES_MIGRATION_JOB, { id }, { dedupe: `files-migration:${id}` });
+      if (!queue.distributed) await queue.wait(row.id);
+    },
+    owned: (id) =>
+      !!db.prepare(`SELECT 1 FROM _jobs WHERE dedupe = ? AND status IN ('pending', 'running')`).get(
+        `files-migration:${id}`,
+      ),
   });
-  // The run lives in the worker, the subscribers here: progress comes back to be published on this realtime.
-  jobs.operation(
-    PROGRESS_OP,
-    (_store, state: unknown) =>
-      realtime.publish(FILES_MIGRATION_TOPIC, state, { access: ({ auth }) => auth?.collection === "_superusers" }),
-  );
-  const cron = new Cron(() => settings.meta.timezone, tracer);
-  cron.useRunner(jobs);
-  systemJobs(cron, db, logs, settings);
+  filesMigrationJob(queue);
+  systemJobs(queue, settings);
   // settings.backups.s3 picks where zips go, swapped on every settings change like the files storage.
   backups?.use(settings.backups.s3, settings.s3);
-  if (backups) onSettingsChange.push((s) => backups.use(s.backups.s3, s.s3));
-  const reloadAutoBackups = autoBackups(cron, backups, settings);
+  if (backups) {
+    onSettingsChange.push((s) => backups.use(s.backups.s3, s.s3));
+    backupJobs(queue, backups);
+  }
+  const reloadAutoBackups = autoBackups(queue, backups, settings);
   onSettingsChange.push(reloadAutoBackups);
   const mcp = new McpHost(opts.mcp);
   const redactor = new PathRedactor();
@@ -181,7 +229,8 @@ export function createApp(opts: AppOptions): App {
     tracer,
     traces,
     requests,
-    cron,
+    queue,
+    services: () => services,
     backups,
     filesMigration,
     adminUi: opts.adminUiDir === false
@@ -197,9 +246,9 @@ export function createApp(opts: AppOptions): App {
   let terminated: Promise<void> | undefined;
   const terminate = () =>
     terminated ??= (async () => {
-      cron.stop();
+      queue.close();
+      await services.close();
       await mcp.close();
-      jobs.terminate();
       stopSharing();
       stopSettingsSync();
       for (const fn of onTerminate.toReversed()) {
@@ -222,8 +271,10 @@ export function createApp(opts: AppOptions): App {
     logs,
     tracer,
     traces,
-    cron,
-    jobs,
+    queue,
+    services,
+    setup: opts.setup === undefined ? undefined : String(opts.setup),
+    role,
     backups,
     filesMigration,
     http,
@@ -236,8 +287,6 @@ export function createApp(opts: AppOptions): App {
   mcp.attach(app, ctx);
   return app;
 }
-
-const MIGRATE_TASK = new URL("./files/tasks/migrate.ts", import.meta.url);
 
 /** When the saved settings last changed ('' before the first save): a cheap read to tell a settings commit apart. */
 function settingsUpdated(db: DatabaseSync): string {

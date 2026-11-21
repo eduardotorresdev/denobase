@@ -14,6 +14,8 @@ const ICONS = {
   ),
   logs: svg('<path d="M3 3h10M3 6.5h7M3 10h10M3 13.5h5"/>'),
   traces: svg('<path d="M2 4h6M5 8h7M8 12h6"/>'),
+  queue: svg('<path d="M3 4h10M3 8h10M3 12h6"/>'),
+  services: svg('<rect x="3" y="3" width="10" height="4" rx="1"/><rect x="3" y="9" width="10" height="4" rx="1"/>'),
   crons: svg('<circle cx="8" cy="8" r="6"/><path d="M8 4.5V8l2.5 1.5"/>'),
   backups: svg(
     '<path d="M2.5 8a5.5 5.5 0 0 1 9.6-3.7L13.5 6"/><path d="M13.5 2.5V6H10"/><path d="M13.5 8a5.5 5.5 0 0 1-9.6 3.7L2.5 10"/><path d="M2.5 13.5V10H6"/>',
@@ -29,6 +31,8 @@ const NAV = [
   { href: "#/", label: "Dashboard", icon: "dashboard" },
   { href: "#/logs", label: "Logs", icon: "logs" },
   { href: "#/traces", label: "Traces", icon: "traces" },
+  { href: "#/queue", label: "Queue", icon: "queue" },
+  { href: "#/services", label: "Services", icon: "services" },
   { href: "#/crons", label: "Crons", icon: "crons" },
   { href: "#/backups", label: "Backups", icon: "backups" },
   { href: "#/notifications", label: "Notifications", icon: "notifications" },

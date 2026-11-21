@@ -3,6 +3,7 @@ import type { AppEnv, Ctx } from "./app.ts";
 import { badRequest, forbidden } from "../core/errors.ts";
 import { verifyToken } from "../auth/jwt.ts";
 import { backupName, isZip, validKey } from "../backups/mod.ts";
+import { backupInUse, createBackup, restoreBackup } from "../backups/ops.ts";
 import { requireSuperuser } from "./guards.ts";
 import { serveContent } from "./serve_content.ts";
 import { boundaryOf, spoolMultipart } from "../files/spool.ts";
@@ -43,7 +44,6 @@ export function backupRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
   app.post("/api/backups", async (c) => {
     requireSuperuser(c);
     const b = fs();
-    if (b.active) throw badRequest("Try again later - another backup/restore process has already been started");
     let body: { name?: unknown } = {};
     const text = await c.req.text();
     if (text.trim()) {
@@ -67,12 +67,7 @@ export function backupRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
       }
       if (error) throw badRequest("An error occurred while validating the submitted data.", { name: error });
     } else name = backupName(ctx.settings.meta.appName, "pb_backup_");
-    try {
-      await b.create(name);
-    } catch (e) {
-      console.error("Failed to create backup", name, e);
-      throw badRequest("Failed to create backup.");
-    }
+    await createBackup(ctx.queue, name);
     return c.body(null, 204);
   });
 
@@ -131,7 +126,7 @@ export function backupRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
     requireSuperuser(c);
     const key = c.req.param("key");
     const b = fs();
-    if (b.active === key) throw badRequest("The backup is currently being used and cannot be deleted.");
+    if (backupInUse(ctx.queue, key)) throw badRequest("The backup is currently being used and cannot be deleted.");
     if (!(await b.exists(key))) throw badRequest("Invalid or already deleted backup file. Raw error: \nnot found");
     await b.delete(key);
     return c.body(null, 204);
@@ -140,11 +135,10 @@ export function backupRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
   app.post("/api/backups/:key/restore", async (c) => {
     requireSuperuser(c);
     const b = fs();
-    if (b.active) throw badRequest("Try again later - another backup/restore process has already been started.");
     const key = c.req.param("key");
     if (!(await b.exists(key))) throw badRequest("Missing or invalid backup file.");
-    // PB answers first and restores a second later, in the background.
-    setTimeout(() => b.restore(key).catch((e) => console.error("Failed to restore backup", key, e)), 1000);
+    // PB answers first and restores in the background: a request to the serve's backups service.
+    await restoreBackup(ctx.queue, b, key);
     return c.body(null, 204);
   });
 }

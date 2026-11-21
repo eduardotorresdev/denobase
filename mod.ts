@@ -34,6 +34,7 @@ export {
   type Client,
   type DisconnectHook,
   isSameAuth,
+  type NamedTopicAccess,
   parseSubscription,
   type PublishOptions,
   Realtime,
@@ -42,7 +43,7 @@ export {
   type SubscriptionOptions,
   type TopicAccess,
 } from "./src/realtime/mod.ts";
-export { type App, type AppOptions, createApp } from "./src/app.ts";
+export { type App, type AppOptions, type AppRole, createApp, defineSetup, loadSetup, type Setup } from "./src/app.ts";
 export {
   DEFAULT_SETTINGS,
   defaultSettings,
@@ -77,9 +78,9 @@ export {
 } from "./src/files/migrate.ts";
 export { MULTIPART_THRESHOLD, S3Storage } from "./src/files/s3/storage.ts";
 export { S3Client, S3Error } from "./src/files/s3/client.ts";
-export { Cron, type CronTrigger, type Job, Schedule } from "./src/cron/mod.ts";
-export * from "./src/jobs/mod.ts";
-export { dbPath, runTask, type Task } from "./src/workers/mod.ts";
+export { Schedule } from "./src/cron/mod.ts";
+export * from "./src/queue/mod.ts";
+export { dbPath } from "./src/workers/mod.ts";
 export { LEVEL, type Log, Logs } from "./src/logs/mod.ts";
 /** Native tracing (app.tracer, app.traces): OTel-shaped spans in the auxiliary db, W3C traceparent. */
 export {
