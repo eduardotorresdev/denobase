@@ -10,7 +10,7 @@ Deno.test("oauth session: the cookie is HttpOnly, SameSite=Lax, Path=/; Secure w
   const res = await b.post("/oauth/login", {
     txn,
     csrf,
-    email: "ana@x.io",
+    email: "su@x.io",
     password: "12345678",
   });
   const sc = res.headers.get("set-cookie")!;
@@ -20,10 +20,12 @@ Deno.test("oauth session: the cookie is HttpOnly, SameSite=Lax, Path=/; Secure w
 
 Deno.test("oauth session: a login issues a new session id (no fixation)", async () => {
   const t = await oauthFixture();
+  const pw = { password: "12345678", passwordConfirm: "12345678" };
+  await t.app.store.collection("_superusers").create({ email: "su2@x.io", ...pw } as never);
   const b = new Browser(t.app);
   await toConsent(b, t.clientId);
   const first = b.cookie;
-  await toConsent(b, t.clientId, { email: "bia@x.io" });
+  await toConsent(b, t.clientId, { email: "su2@x.io" });
   assertNotEquals(b.cookie, first);
   // The old id no longer opens a session.
   const stale = new Browser(t.app);
@@ -52,7 +54,7 @@ Deno.test("oauth session: a cross-site POST (foreign Origin or Sec-Fetch-Site) i
     "sec-fetch-site": "cross-site",
   });
   assertEquals(site.status, 403);
-  const login = await b.post("/oauth/login", { txn, email: "ana@x.io", password: "12345678" }, { origin: "null" });
+  const login = await b.post("/oauth/login", { txn, email: "su@x.io", password: "12345678" }, { origin: "null" });
   assertEquals(login.status, 403);
 });
 
@@ -85,7 +87,7 @@ Deno.test("oauth session: wrong password re-renders the login with one message; 
   const bad = await b.post("/oauth/login", {
     txn,
     csrf: csrf0,
-    email: "ana@x.io",
+    email: "su@x.io",
     password: "nope",
   });
   assertEquals(bad.status, 400);

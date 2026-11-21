@@ -32,7 +32,6 @@ export function resolveMcpOptions(o: McpOptions = {}): ResolvedMcpOptions {
     prefix: o.prefix ?? "db_",
     allowedOrigins: o.allowedOrigins ?? [],
     requireAudience: o.requireAudience ?? true,
-    allowGuest: o.allowGuest ?? false,
     maxResultBytes: o.maxResultBytes ?? 256 * 1024,
     toolTimeoutMs: o.toolTimeoutMs ?? 30_000,
     builtins: o.builtins ?? true,
@@ -168,6 +167,8 @@ export class McpHost implements Mcp {
     // The same base http.ts checks against: appURL, else the URL the client will call (no guessed localhost).
     const base = this.app.settings.meta.appURL || opts.baseURL;
     if (!base) throw badRequest("Set settings.meta.appURL (or pass baseURL) to mint an MCP token.");
+    // Only superusers use the MCP; a token for anyone else would be refused at /api/mcp anyway.
+    if (collection !== "_superusers") throw badRequest("MCP tokens are for superusers only.");
     const col = getCollection(collection, this.http.collections);
     const cred = this.http.s.credentials(this.app.db, col.slug, { id });
     if (!cred) throw badRequest("Missing auth record.");
@@ -176,16 +177,8 @@ export class McpHost implements Mcp {
 }
 
 /** The RFC 8707 resource id of this server: <base>/api/mcp (base without a trailing slash). */
-export function mcpResource(base: string, collection = ""): string {
-  return `${base.replace(/\/+$/, "")}${mcpPath(collection)}`;
-}
-
-/**
- * /api/mcp, or /api/mcp/<collection> for a client that must sign in against that auth collection (a superuser's
- * admin tools): a path, not a query, since clients check that the resource metadata names the URL they were given.
- */
-export function mcpPath(collection = ""): string {
-  return collection ? `${MCP_PATH}/${collection}` : MCP_PATH;
+export function mcpResource(base: string): string {
+  return `${base.replace(/\/+$/, "")}${MCP_PATH}`;
 }
 
 function zTraces() {

@@ -5,6 +5,9 @@ import { requireSuperuser } from "./guards.ts";
 
 const int = (v: string | undefined) => (v && /^\d+$/.test(v) ? Number(v) : undefined);
 const TRACE_ID = /^[0-9a-f]{32}$/;
+/** `since` is a PB date ("2026-01-02 10:00:00.000Z"), compared as text with the stored created; anything else is ignored. */
+const since = (v: string | undefined) =>
+  v && /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?Z?$/.test(v) ? v.replace("T", " ") : undefined;
 
 /**
  * Denobase-only traces API (PB has none), shaped like the logs API: superuser-only list, stats, view, truncate.
@@ -16,7 +19,13 @@ export function traceRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
   app.get("/api/traces", (c) => {
     const q = c.req.query();
     return c.json(
-      ctx.traces.listTraces({ filter: q.filter, sort: q.sort, page: int(q.page), perPage: int(q.perPage) }),
+      ctx.traces.listTraces({
+        filter: q.filter,
+        since: since(q.since),
+        sort: q.sort,
+        page: int(q.page),
+        perPage: int(q.perPage),
+      }),
     );
   });
   app.delete("/api/traces", (c) => {
@@ -24,7 +33,7 @@ export function traceRoutes(app: Hono<AppEnv>, ctx: Ctx): void {
     return c.body(null, 204);
   });
   app.get("/api/traces/stats", (c) => {
-    const filter = c.req.query("filter");
+    const filter = { filter: c.req.query("filter"), since: since(c.req.query("since")) };
     if (c.req.query("groupBy") === "name") return c.json(ctx.traces.slowest(filter));
     if (c.req.query("groupBy") === "total") return c.json(ctx.traces.overall(filter));
     if (c.req.query("groupBy") === "attribute") {

@@ -3,6 +3,7 @@ import { DatabaseSync } from "node:sqlite";
 import type { JobContext } from "../../jobs/context.ts";
 import { Logs } from "../../logs/mod.ts";
 import { MAX_SPAN_ROWS, Spans } from "../../telemetry/store.ts";
+import { RequestStats } from "../../telemetry/requests.ts";
 import { deleteExpiredOtps } from "../../auth/otp.ts";
 import { cleanupOAuth } from "../../oauth/tables.ts";
 
@@ -53,6 +54,8 @@ export async function maintain(
           await spans.deleteOlderThan(new Date(Date.now() - input.maxDays * 86_400_000));
         }
         await spans.trimTo(MAX_SPAN_ROWS);
+        // The home's request counts compare a day with the one before; a week covers that with room to spare.
+        new RequestStats(aux()).deleteOlderThan(new Date(Date.now() - 7 * 86_400_000));
       }
       return;
     case "dbOptimize":

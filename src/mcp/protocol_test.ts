@@ -3,7 +3,7 @@ import { connect, fixture, structured } from "./testkit.ts";
 
 Deno.test("protocol: tools/call with invalid input is a tool error naming the field", async () => {
   const t = await fixture();
-  const c = await connect(t.app, t.anaToken);
+  const c = await connect(t.app, t.suToken);
   const r = await c.callTool({ name: "db_list", arguments: { collection: "mt_notas", perPage: 5000 } });
   assert(r.isError);
   assertMatch(JSON.stringify(r.content), /perPage/);
@@ -27,21 +27,19 @@ Deno.test("protocol: tools/list carries the JSON Schema of the zod input and the
   await c.close();
 });
 
-Deno.test("protocol: resources/read of a record template reads as the caller", async () => {
+Deno.test("protocol: resources/read of a record template reads the record", async () => {
   const t = await fixture();
-  const c = await connect(t.app, t.anaToken);
+  const c = await connect(t.app, t.suToken);
   const own = await c.readResource({ uri: `record://mt_notas/${t.notaAna.id}` });
   const content = own.contents[0] as { text: string; mimeType?: string };
   assertEquals(content.mimeType, "application/json");
   assertEquals(JSON.parse(content.text).titulo, "da ana");
-  const other = await c.readResource({ uri: `record://mt_notas/${t.notaBia.id}` }).catch((e) => e);
-  assert(other instanceof Error);
   await c.close();
 });
 
 Deno.test("protocol: resources/list includes the static resources and the templates' listings", async () => {
   const t = await fixture();
-  const c = await connect(t.app, t.anaToken);
+  const c = await connect(t.app, t.suToken);
   const uris = (await c.listResources()).resources.map((r) => r.uri);
   assert(uris.includes("schema://collections"));
   assert(uris.includes("schema://collections/mt_notas"));
@@ -52,7 +50,7 @@ Deno.test("protocol: resources/list includes the static resources and the templa
 
 Deno.test("protocol: prompts/get renders with the args; a missing required arg is an error", async () => {
   const t = await fixture();
-  const c = await connect(t.app, t.anaToken);
+  const c = await connect(t.app, t.suToken);
   const p = await c.getPrompt({ name: "explorar-collection", arguments: { collection: "mt_notas" } });
   assertEquals(p.messages[0].role, "user");
   assertMatch((p.messages[0].content as { text: string }).text, /schema:\/\/collections\/mt_notas/);
@@ -73,11 +71,11 @@ Deno.test("protocol: a result over maxResultBytes is an isError with a paging hi
 
 Deno.test("protocol: a missing resource is resource-not-found with the uri and the stable code", async () => {
   const t = await fixture();
-  const c = await connect(t.app, t.anaToken);
-  const e = await c.readResource({ uri: `record://mt_notas/${t.notaBia.id}` }).catch((e) => e);
+  const c = await connect(t.app, t.suToken);
+  const e = await c.readResource({ uri: `record://mt_notas/naoexiste12345` }).catch((e) => e);
   // The SDK puts resource-not-found on the wire as -32602 (2026-07-28 MUST; -32002 in older revisions).
   assertEquals(e.code, -32602);
-  assertEquals(e.data.uri, `record://mt_notas/${t.notaBia.id}`);
+  assertEquals(e.data.uri, "record://mt_notas/naoexiste12345");
   assertEquals(e.data.status, 404);
   assertEquals(e.data.code, "nao_encontrado");
   await c.close();

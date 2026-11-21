@@ -6,16 +6,24 @@ import { recordExceptionOnce, type Tracer } from "../tracer.ts";
 
 /**
  * Paths that never open a trace: the admin's own reads of traces and logs (they would trace themselves), the admin
- * UI's files, the dashboard's polling, health checks and the realtime stream (a connection held for minutes).
+ * UI's files, the dashboard's own endpoints (they would show up in the figures they draw), health checks and the
+ * realtime stream (a connection held for minutes).
  */
 const EXCLUDED = [
   /^\/api\/traces(\/|$)/,
   /^\/api\/logs(\/|$)/,
   /^\/_\//,
-  /^\/api\/_denobase\/stats$/,
+  /^\/api\/_denobase\//,
   /^\/api\/realtime$/,
   /^\/api\/health$/,
 ];
+
+/**
+ * Requests the admin UI makes for itself send this header. They are still traced (an admin's failed edit is worth a
+ * trace) but marked, and the admin home leaves them out of its figures: opening the panel is not the app's traffic.
+ */
+export const ADMIN_UI_HEADER = "x-denobase-admin";
+export const ADMIN_UI_ATTR = "denobase.admin_ui";
 
 export function isTraced(path: string): boolean {
   return !EXCLUDED.some((re) => re.test(path));
@@ -70,6 +78,7 @@ export function tracingMiddleware(
         "url.path": opts.redactPath ? opts.redactPath(url.pathname) : url.pathname,
         "url.query": redactQuery(url.search),
         "user_agent.original": c.req.header("user-agent")?.slice(0, 500),
+        ...(c.req.header(ADMIN_UI_HEADER) ? { [ADMIN_UI_ATTR]: true } : {}),
       },
     };
     const nested = !!currentSpan();

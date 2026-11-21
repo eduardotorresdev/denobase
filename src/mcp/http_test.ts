@@ -1,5 +1,6 @@
 import { assert, assertEquals, assertMatch } from "@std/assert";
 import { connect, fixture, INITIALIZE, rpc } from "./testkit.ts";
+import { tokenFor } from "../testing/mod.ts";
 
 Deno.test("mcp http: GET and DELETE answer 405 (stateless, no sessions), behind the same auth as POST", async () => {
   const t = await fixture();
@@ -49,10 +50,13 @@ Deno.test("mcp http: by default a session token is refused and app.mcp.token's i
   const plain = await rpc(t.app, INITIALIZE, { Authorization: t.anaSession });
   assertEquals(plain.status, 401);
   assertMatch(plain.headers.get("WWW-Authenticate") ?? "", /error="invalid_token"/);
-  const scoped = await t.app.mcp.token("mt_users", t.ana.id, { ttl: 3600 });
+  const scoped = await t.app.mcp.token("_superusers", t.su.id, { ttl: 3600 });
   assertEquals((await rpc(t.app, INITIALIZE, { Authorization: scoped })).status, 200);
+  // Without the audience check a session token gets past it, but an app user's is still not a superuser's.
   const off = await fixture({ mcp: { requireAudience: false } });
-  assertEquals((await rpc(off.app, INITIALIZE, { Authorization: off.anaSession })).status, 200);
+  const suSession = await tokenFor(off.app.db, "_superusers", off.su);
+  assertEquals((await rpc(off.app, INITIALIZE, { Authorization: suSession })).status, 200);
+  assertEquals((await rpc(off.app, INITIALIZE, { Authorization: off.anaSession })).status, 403);
 });
 
 Deno.test("mcp http: an MCP token is scoped to /api/mcp; the REST API treats it as a guest", async () => {
@@ -68,16 +72,16 @@ Deno.test("mcp http: an MCP token is scoped to /api/mcp; the REST API treats it 
 Deno.test("mcp http: without appURL the token is minted for the given baseURL and the check uses the same base", async () => {
   const t = await fixture();
   t.app.settings.meta.appURL = "";
-  await t.app.mcp.token("mt_users", t.ana.id).then(() => {
+  await t.app.mcp.token("_superusers", t.su.id).then(() => {
     throw new Error("minted without a base");
   }, () => {});
-  const tok = await t.app.mcp.token("mt_users", t.ana.id, { baseURL: "http://localhost" });
+  const tok = await t.app.mcp.token("_superusers", t.su.id, { baseURL: "http://localhost" });
   assertEquals((await rpc(t.app, INITIALIZE, { Authorization: tok })).status, 200);
 });
 
 Deno.test("mcp http: the legacy initialize handshake answers server info and capabilities", async () => {
   const t = await fixture();
-  const r = await rpc(t.app, INITIALIZE, { Authorization: t.anaToken });
+  const r = await rpc(t.app, INITIALIZE, { Authorization: t.suToken });
   assertEquals(r.status, 200);
   const text = await r.text();
   const body = JSON.parse(text.startsWith("{") ? text : text.split("\n").find((l) => l.startsWith("data:"))!.slice(5));
@@ -91,7 +95,7 @@ Deno.test("mcp http: the legacy initialize handshake answers server info and cap
 Deno.test("mcp http: both protocol eras serve the same tools through the SDK client", async () => {
   const t = await fixture();
   for (const mode of ["legacy", "modern"] as const) {
-    const c = await connect(t.app, t.anaToken, mode);
+    const c = await connect(t.app, t.suToken, mode);
     const names = (await c.listTools()).tools.map((x) => x.name);
     assert(names.includes("db_list"), mode);
     await c.close();
@@ -100,11 +104,11 @@ Deno.test("mcp http: both protocol eras serve the same tools through the SDK cli
 
 Deno.test("mcp http: a tool call logs one mcp line and the POST itself is not activity-logged", async () => {
   const t = await fixture();
-  const c = await connect(t.app, t.anaToken);
+  const c = await connect(t.app, t.suToken);
   await c.callTool({ name: "db_health", arguments: {} });
   await c.close();
   const lines = t.app.logs.list({ perPage: 100 }).items;
   const mcp = lines.filter((l) => l.data.type === "mcp");
-  assertEquals(mcp.map((l) => [l.data.tool, l.data.isError, l.data.authId]), [["db_health", false, t.ana.id]]);
+  assertEquals(mcp.map((l) => [l.data.tool, l.data.isError, l.data.authId]), [["db_health", false, t.su.id]]);
   assertEquals(lines.filter((l) => String(l.message).includes("/api/mcp")), []);
 });

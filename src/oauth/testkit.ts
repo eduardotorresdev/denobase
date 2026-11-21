@@ -18,14 +18,14 @@ export interface OAuthFixture extends Fixture {
   suSession: string;
 }
 
-/** The MCP fixture (mt_users: ana, bia; su) with OAuth authorizing _superusers and mt_users, and a DCR client. */
+/** The MCP fixture (mt_users: ana, bia; su) with OAuth (superusers only authorize) and a DCR client. */
 export async function oauthFixture(
   oauth: OAuthOptions = {},
   opts: Partial<AppOptions> = {},
 ): Promise<OAuthFixture> {
   const t = await fixture({
     ...opts,
-    mcp: { ...opts.mcp, oauth: { collections: ["mt_users", "_superusers"], ...oauth } },
+    mcp: { ...opts.mcp, oauth },
   });
   const reg = await register(t.app, {
     redirect_uris: [REDIRECT],
@@ -108,19 +108,14 @@ export function txnCsrf(app: App, txn: string): string {
   return (app.db.prepare(`SELECT csrf FROM _oauth_requests WHERE id = ?`).get(txn) as { csrf: string }).csrf;
 }
 
-/** The request's auth_collection: the one `who` belongs to, when named; else the server's default (mt_users here). */
-function withCollection(who: { collection?: string }, extra: Record<string, string>): Record<string, string> {
-  return who.collection ? { auth_collection: who.collection, ...extra } : extra;
-}
-
 /** Login (password) from a fresh authorize, through to the consent page; returns its txn and csrf. */
 export async function toConsent(
   b: Browser,
   clientId: string,
-  who: { email: string; collection?: string } = { email: "ana@x.io" },
+  who: { email: string } = { email: "su@x.io" },
   extra: Record<string, string> = {},
 ): Promise<{ txn: string; csrf: string; html: string }> {
-  const login = await b.get(authorizeQuery(clientId, withCollection(who, extra)));
+  const login = await b.get(authorizeQuery(clientId, extra));
   assertEquals(login.status, 200);
   const loginHtml = await login.text();
   const txn = hidden(loginHtml, "txn");
@@ -163,10 +158,10 @@ export async function delivered(res: Response, redirect = REDIRECT): Promise<URL
 export async function authorizeCode(
   b: Browser,
   clientId: string,
-  who: { email: string; collection?: string } = { email: "ana@x.io" },
+  who: { email: string } = { email: "su@x.io" },
   extra: Record<string, string> = {},
 ): Promise<string> {
-  const login = await b.get(authorizeQuery(clientId, withCollection(who, extra)));
+  const login = await b.get(authorizeQuery(clientId, extra));
   const loginHtml = await login.text();
   const txn = hidden(loginHtml, "txn");
   const res = await b.post("/oauth/login", {
@@ -205,7 +200,7 @@ export function exchange(app: App, clientId: string, code: string, extra: Record
 }
 
 /** Authorization through tokens in one go. */
-export async function tokens(t: OAuthFixture, who?: { email: string; collection?: string }) {
+export async function tokens(t: OAuthFixture, who?: { email: string }) {
   const code = await authorizeCode(new Browser(t.app), t.clientId, who);
   const r = await exchange(t.app, t.clientId, code);
   assertEquals(r.status, 200, JSON.stringify(r.body));

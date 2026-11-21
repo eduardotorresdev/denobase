@@ -4,7 +4,6 @@ import type { OAuthOptions, ResolvedOAuthOptions } from "./types.ts";
 export function resolveOAuthOptions(o: OAuthOptions = {}): ResolvedOAuthOptions {
   return {
     enabled: o.enabled ?? true,
-    collections: o.collections ?? ["_superusers"],
     scopes: o.scopes ?? [],
     extraResources: o.extraResources ?? [],
     clients: o.clients ?? [],

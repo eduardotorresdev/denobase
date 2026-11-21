@@ -43,19 +43,20 @@ const neutral = (html: string) => html.replaceAll(hidden(html, "txn"), "TXN").re
 Deno.test("oauth silent handoff: a web session of the request's collection goes straight to consent", async () => {
   const t = await oauthFixture({ webLogin: { url: WEB } });
   const b = new Browser(t.app);
-  const res = await silent(t, b, t.anaSession, { auth_collection: "mt_users" });
+  const res = await silent(t, b, t.suSession);
   assertEquals(res.status, 200);
   const html = await res.text();
-  assertStringIncludes(html, "ana@x.io");
+  assertStringIncludes(html, "su@x.io");
   assertStringIncludes(html, 'name="action"');
   const txn = hidden(html, "txn");
   await delivered(await b.post("/oauth/consent", { txn, csrf: hidden(html, "csrf"), action: "allow" }));
 });
 
-Deno.test("oauth silent handoff: no token, or one of another collection, ends on the same login page, once", async () => {
+Deno.test("oauth silent handoff: no token, or an app user's, ends on the same login page, once", async () => {
   const t = await oauthFixture({ webLogin: { url: WEB } });
-  const none = await silent(t, new Browser(t.app), null, { auth_collection: "_superusers" });
-  const other = await silent(t, new Browser(t.app), t.anaSession, { auth_collection: "_superusers" });
+  const none = await silent(t, new Browser(t.app), null);
+  // An app user's own web session never signs in here: only superusers use the MCP.
+  const other = await silent(t, new Browser(t.app), t.anaSession);
   assertEquals(none.status, 200);
   assertEquals(other.status, 200);
   const a = neutral(await none.text());
@@ -89,7 +90,7 @@ Deno.test("oauth silent handoff: prompt=login skips it and a handoff code does n
   const code = await t.app.fetch(
     new Request("http://localhost/oauth/handoff", {
       method: "POST",
-      headers: { "content-type": "application/json", Authorization: t.anaSession },
+      headers: { "content-type": "application/json", Authorization: t.suSession },
       body: JSON.stringify({ txn }),
     }),
   );
@@ -110,7 +111,7 @@ Deno.test("oauth silent handoff: prompt=none tries it, then answers login_requir
 
 Deno.test("oauth silent handoff: prompt=none with a web session of the request's collection still needs consent", async () => {
   const t = await oauthFixture({ webLogin: { url: WEB } });
-  const res = await silent(t, new Browser(t.app), t.anaSession, { prompt: "none" });
+  const res = await silent(t, new Browser(t.app), t.suSession, { prompt: "none" });
   assertEquals(callback(res).searchParams.get("error"), "consent_required");
 });
 
@@ -123,7 +124,7 @@ Deno.test("oauth silent handoff: a spent, expired or other browser's code ends o
     const res = await t.app.fetch(
       new Request("http://localhost/oauth/handoff", {
         method: "POST",
-        headers: { "content-type": "application/json", Authorization: t.anaSession },
+        headers: { "content-type": "application/json", Authorization: t.suSession },
         body: JSON.stringify({ txn }),
       }),
     );

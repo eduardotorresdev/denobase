@@ -9,13 +9,13 @@ import type { ServeOptions } from "./serve.ts";
 
 /**
  * `mcp [--db path] [--as email]`: the app's MCP over stdio, for a local client (Claude Code) pointing at the
- * binary. Without --as the session is superuser; the consumer's beforeServe runs so its tools are registered.
+ * binary. Only superusers use the MCP: without --as the session is the implicit superuser, --as names one; the consumer's beforeServe runs so its tools are registered.
  */
 export function mcpCommand(opts: ServeOptions = {}): Command {
   return {
     name: "mcp",
     usage: "[--db path] [--as email]",
-    description: "serve the MCP server over stdio (superuser unless --as)",
+    description: "serve the MCP server over stdio (as a superuser: implicit, or --as email)",
     run: async (c) => {
       // stdout is the protocol channel: anything the app prints goes to stderr.
       console.log = console.error;
@@ -34,7 +34,7 @@ export function mcpCommand(opts: ServeOptions = {}): Command {
       await opts.beforeServe?.(app);
       const email = c.str("as");
       const user = email ? await principalByEmail(app, email) : STDIO_SUPERUSER;
-      if (!user) throw new UsageError(`--as: no auth record with email ${email}`);
+      if (!user) throw new UsageError(`--as: no superuser with email ${email}`);
       const handle = serveMcpStdio(app, user);
       const closed = Promise.withResolvers<void>();
       // The client closing stdin ends the session; an extra listener does not steal the transport's data.

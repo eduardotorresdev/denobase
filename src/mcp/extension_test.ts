@@ -2,6 +2,16 @@ import { assert, assertEquals, assertFalse, assertThrows } from "@std/assert";
 import { z } from "zod";
 import { stableForbidden } from "../core/errors.ts";
 import { connect, fixture, structured } from "./testkit.ts";
+import { superusers } from "../core/superusers.ts";
+import type { App } from "../app.ts";
+import type { Doc } from "../core/types.ts";
+
+/** A second superuser and its MCP token: only superusers reach the MCP, so per-principal checks need two. */
+async function otherSuperuser(app: App): Promise<{ doc: Doc; token: string }> {
+  const pw = { password: "12345678", passwordConfirm: "12345678" };
+  const doc = await app.store.collection(superusers).create({ email: "su2@x.io", ...pw } as never) as Doc;
+  return { doc, token: await app.mcp.token("_superusers", doc.id) };
+}
 
 Deno.test("extension: a consumer tool appears in tools/list and runs as the caller with ctx.store", async () => {
   const t = await fixture();
@@ -19,17 +29,18 @@ Deno.test("extension: a consumer tool appears in tools/list and runs as the call
       };
     },
   });
-  const c = await connect(t.app, t.anaToken);
+  const c = await connect(t.app, t.suToken);
   const tool = (await c.listTools()).tools.find((x) => x.name === "pbs_minhas_notas");
   assert(tool);
   assertEquals(tool.outputSchema?.type, "object");
   const r = await c.callTool({ name: "pbs_minhas_notas", arguments: { prefixo: "da" } });
-  assertEquals(r.structuredContent, { total: 1, quem: t.ana.id });
+  assertEquals(r.structuredContent, { total: 2, quem: t.su.id });
   await c.close();
 });
 
 Deno.test("extension: a thrown stable error becomes isError with its code; visibility and allow() hide tools", async () => {
   const t = await fixture();
+  const other = await otherSuperuser(t.app);
   t.app.mcp.tool({
     name: "pbs_recusa",
     description: "Always refuses.",
@@ -37,10 +48,10 @@ Deno.test("extension: a thrown stable error becomes isError with its code; visib
     handler: () => Promise.reject(stableForbidden("Nao pode.", "lote_bloqueado")),
   });
   t.app.mcp.tool({
-    name: "pbs_so_bia",
-    description: "Only Bia sees it.",
+    name: "pbs_so_outro",
+    description: "Only the other superuser sees it.",
     input: z.object({}),
-    allow: (ctx) => ctx.user?.id === t.bia.id,
+    allow: (ctx) => ctx.user?.id === other.doc.id,
     handler: () => Promise.resolve({ ok: true }),
   });
   t.app.mcp.tool({
@@ -50,18 +61,16 @@ Deno.test("extension: a thrown stable error becomes isError with its code; visib
     input: z.object({}),
     handler: (_a, ctx) => Promise.resolve({ system: !!ctx.system }),
   });
-  const ana = await connect(t.app, t.anaToken);
-  const r = await ana.callTool({ name: "pbs_recusa", arguments: {} });
+  const su = await connect(t.app, t.suToken);
+  const r = await su.callTool({ name: "pbs_recusa", arguments: {} });
   assert(r.isError);
   assertEquals(structured(r).code, "lote_bloqueado");
-  const names = (await ana.listTools()).tools.map((x) => x.name);
-  assertFalse(names.includes("pbs_so_bia"));
-  assertFalse(names.includes("pbs_admin"));
-  await ana.close();
-  const bia = await connect(t.app, t.biaToken);
-  assert((await bia.listTools()).tools.some((x) => x.name === "pbs_so_bia"));
-  await bia.close();
-  const su = await connect(t.app, t.suToken);
+  const names = (await su.listTools()).tools.map((x) => x.name);
+  assertFalse(names.includes("pbs_so_outro"));
+  assert(names.includes("pbs_admin"));
+  const o = await connect(t.app, other.token);
+  assert((await o.listTools()).tools.some((x) => x.name === "pbs_so_outro"));
+  await o.close();
   assertEquals((await su.callTool({ name: "pbs_admin", arguments: {} })).structuredContent, { system: true });
   await su.close();
 });
@@ -86,7 +95,7 @@ Deno.test("extension: resources, templates and prompts registered by the consume
     args: z.object({ tema: z.string() }),
     render: (a) => `Relatorio sobre ${a.tema}`,
   });
-  const c = await connect(t.app, t.anaToken);
+  const c = await connect(t.app, t.suToken);
   assertEquals(((await c.readResource({ uri: "pbs://docs/index" })).contents[0] as { text: string }).text, "# Docs");
   assertEquals(((await c.readResource({ uri: "pbs://docs/adr" })).contents[0] as { text: string }).text, "doc adr");
   const p = await c.getPrompt({ name: "gerar-relatorio", arguments: { tema: "lotes" } });
@@ -112,7 +121,7 @@ Deno.test("extension: names are validated, duplicates refused, unregister remove
 
 Deno.test("extension: registering after connect notifies tools/list_changed to a listening 2026 client", async () => {
   const t = await fixture();
-  const c = await connect(t.app, t.anaToken, "modern");
+  const c = await connect(t.app, t.suToken, "modern");
   const changed = Promise.withResolvers<void>();
   c.setNotificationHandler("notifications/tools/list_changed", () => changed.resolve());
   const sub = await c.listen({ toolsListChanged: true });
@@ -149,17 +158,18 @@ Deno.test("extension: an async allow() decides tools/list per principal", async 
   const t = await fixture();
   t.app.mcp.tool({
     name: "pbs_async",
-    description: "Visible to whoever owns a note titled 'da bia'.",
+    description: "Visible to the principal whose email the store says is su2@x.io.",
     input: z.object({}),
-    allow: async (ctx) => (await ctx.store.collection("mt_notas").find()).some((n) => n.titulo === "da bia"),
+    allow: async (ctx) => (await ctx.store.collection("_superusers").findOne(ctx.user?.id ?? ""))?.email === "su2@x.io",
     handler: () => Promise.resolve({ ok: true }),
   });
-  const ana = await connect(t.app, t.anaToken);
-  assertFalse((await ana.listTools()).tools.some((x) => x.name === "pbs_async"));
-  await ana.close();
-  const bia = await connect(t.app, t.biaToken);
-  assert((await bia.listTools()).tools.some((x) => x.name === "pbs_async"));
-  await bia.close();
+  const other = await otherSuperuser(t.app);
+  const su = await connect(t.app, t.suToken);
+  assertFalse((await su.listTools()).tools.some((x) => x.name === "pbs_async"));
+  await su.close();
+  const o = await connect(t.app, other.token);
+  assert((await o.listTools()).tools.some((x) => x.name === "pbs_async"));
+  await o.close();
 });
 
 Deno.test("extension: a group prefixes every name, refuses the built-ins' prefix and comes off at once", async () => {
@@ -191,7 +201,7 @@ Deno.test("extension: one naming rule for every kind; resource names are listed 
     Error,
     "duplicate resource name",
   );
-  const c = await connect(t.app, t.anaToken);
+  const c = await connect(t.app, t.suToken);
   const r = (await c.listResources()).resources.find((x) => x.uri === "x://a");
   assertEquals(r?.name, "x_a");
   await c.close();
@@ -206,7 +216,7 @@ Deno.test("extension: a tool with an output schema that returns a non-object is 
     output: z.object({ items: z.array(z.number()) }),
     handler: () => Promise.resolve([1, 2] as never),
   });
-  const c = await connect(t.app, t.anaToken);
+  const c = await connect(t.app, t.suToken);
   const r = await c.callTool({ name: "pbs_lista", arguments: {} });
   assert(r.isError);
   assertEquals(structured(r).code, "erro_interno");

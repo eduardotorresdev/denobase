@@ -2,7 +2,7 @@ import { assert, assertEquals, assertFalse, assertStringIncludes } from "@std/as
 import { authorizeQuery, Browser, delivered, hidden, oauthFixture } from "./testkit.ts";
 import { failureDelayMs, LIMITS } from "./ratelimit.ts";
 
-const ana = { email: "ana@x.io" };
+const su = { email: "su@x.io" };
 
 async function loginPage(b: Browser, clientId: string) {
   const html = await (await b.get(authorizeQuery(clientId))).text();
@@ -15,11 +15,11 @@ Deno.test("oauth login: a request opened in one browser cannot be signed in from
   const { txn, csrf } = await loginPage(attacker, t.clientId);
   // The victim's browser posts the attacker's request with the attacker's credentials: no binding cookie, refused.
   const victim = new Browser(t.app);
-  const res = await victim.post("/oauth/login", { txn, csrf, ...ana, password: "12345678" });
+  const res = await victim.post("/oauth/login", { txn, csrf, ...su, password: "12345678" });
   assertEquals(res.status, 403);
   assert(!victim.cookie.includes("denobase_oauth="));
   // Its own browser without the form token is refused too.
-  assertEquals((await attacker.post("/oauth/login", { txn, ...ana, password: "12345678" })).status, 403);
+  assertEquals((await attacker.post("/oauth/login", { txn, ...su, password: "12345678" })).status, 403);
 });
 
 Deno.test("oauth login: failures on someone's email from elsewhere do not lock them out", async () => {
@@ -29,13 +29,13 @@ Deno.test("oauth login: failures on someone's email from elsewhere do not lock t
   // As many failures as pass without delay, all from the attacker's IP.
   for (let i = 0; i < LIMITS.accountFail[0]; i++) {
     const { txn, csrf } = await loginPage(attacker, t.clientId);
-    const r = await attacker.post("/oauth/login", { txn, csrf, ...ana, password: "wrong" }, ip("10.0.0.1"));
+    const r = await attacker.post("/oauth/login", { txn, csrf, ...su, password: "wrong" }, ip("10.0.0.1"));
     assertEquals(r.status, 400);
   }
   // The real user, elsewhere, still signs in (after a short delay at most).
   const user = new Browser(t.app);
   const mine = await loginPage(user, t.clientId);
-  const ok = await user.post("/oauth/login", { ...mine, ...ana, password: "12345678" }, ip("192.168.1.9"));
+  const ok = await user.post("/oauth/login", { ...mine, ...su, password: "12345678" }, ip("192.168.1.9"));
   assertEquals(ok.status, 303);
   assertEquals(failureDelayMs(0), 0);
   assertEquals(failureDelayMs(LIMITS.accountFail[0]), 250);
@@ -56,8 +56,8 @@ Deno.test("oauth handoff: the web app's session signs the browser in, once, only
     );
   assertEquals((await handoff(null)).status, 401);
   // An MCP token (aud) is not a web session.
-  assertEquals((await handoff(`Bearer ${t.anaToken}`)).status, 401);
-  const res = await handoff(t.anaSession);
+  assertEquals((await handoff(`Bearer ${t.suToken}`)).status, 401);
+  const res = await handoff(t.suSession);
   assertEquals(res.status, 200);
   const url = new URL((await res.json()).url);
   const path = url.pathname + url.search;
@@ -68,11 +68,11 @@ Deno.test("oauth handoff: the web app's session signs the browser in, once, only
   assertEquals((await b.get(path)).status, 303);
   assert(!b.cookie.includes("denobase_oauth="));
   // A fresh code in the right browser opens the consent screen as Ana, without a password.
-  const fresh = new URL((await (await handoff(t.anaSession)).json()).url);
+  const fresh = new URL((await (await handoff(t.suSession)).json()).url);
   const redeemed = await b.get(fresh.pathname + fresh.search);
   assertEquals(redeemed.status, 303);
   const consent = await (await b.get(redeemed.headers.get("location")!)).text();
-  assertStringIncludes(consent, "ana@x.io");
+  assertStringIncludes(consent, "su@x.io");
   await delivered(await b.post("/oauth/consent", { txn, csrf: hidden(consent, "csrf"), action: "allow" }));
 });
 

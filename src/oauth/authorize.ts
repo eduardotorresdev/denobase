@@ -130,19 +130,9 @@ export function authorizeRoutes(app: Hono<AppEnv>, f: Flow): void {
     if (prompt.some((p) => !PROMPTS.includes(p)) || (prompt.includes("none") && prompt.length > 1)) {
       return backError("invalid_request", "Unsupported prompt.");
     }
-    if (!o.collections().length) return backError("server_error", "No collection may authorize.");
-    // Who starts the request picks the collection; the login page never shows nor changes it.
-    const fixed = client.authCollection;
-    if (fixed && q.auth_collection && q.auth_collection !== fixed) {
-      return backError("invalid_request", "auth_collection does not match this client.");
-    }
-    // A collection-bound resource (/api/mcp/<collection>) carries its collection; nothing may ask for another.
-    const bound = o.resourceCollection(c, resource);
-    if (bound && ((fixed && fixed !== bound) || (q.auth_collection && q.auth_collection !== bound))) {
-      return backError("invalid_request", "auth_collection does not match this resource.");
-    }
-    const col = o.authCollection(bound || fixed || q.auth_collection);
-    if (!col) return backError("invalid_request", "auth_collection may not authorize.");
+    // Only superusers authorize; app users never sign in here (they use the app's own auth and providers).
+    const col = o.authCollection();
+    if (!col) return backError("server_error", "No collection may authorize.");
     const now = Date.now();
     const row: OAuthRequest = {
       id: randomToken(),

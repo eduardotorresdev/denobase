@@ -47,37 +47,25 @@ export class OAuthCtx {
   }
 
   resources(c: Context<AppEnv>): string[] {
-    const bound = this.collections().map((col) => mcpResource(this.issuer(c), col.slug));
-    return [this.resource(c), ...bound, ...this.opts.extraResources];
-  }
-
-  /** The auth collection a collection-bound resource (<base>/api/mcp/<collection>) signs in against; "" otherwise. */
-  resourceCollection(c: Context<AppEnv>, resource: string): string {
-    return this.collections().find((col) => mcpResource(this.issuer(c), col.slug) === resource)?.slug ?? "";
-  }
-
-  /** The code's collections narrowed by settings.oauth.allowedCollections; only real auth collections. */
-  collections(): CollectionConfig[] {
-    const allowed = this.settings.allowedCollections;
-    const out: CollectionConfig[] = [];
-    for (const slug of this.opts.collections) {
-      if (allowed.length && !allowed.includes(slug)) continue;
-      try {
-        const col = getCollection(slug, this.http.collections);
-        if (col.auth) out.push(col);
-      } catch { /* not served by this app */ }
-    }
-    return out;
+    return [this.resource(c), ...this.opts.extraResources];
   }
 
   /**
-   * The collection a request signs in against: `asked` (auth_collection), else settings.oauth.defaultCollection, else
-   * the first that may authorize. null when `asked` names one that may not.
+   * Who may authorize: superusers only. The MCP is an admin tool; app users sign in through the app's own auth
+   * (password, its OAuth2/OIDC providers), never through this server. A list, as the pages and session code ask.
    */
-  authCollection(asked: string | undefined): CollectionConfig | null {
-    const cols = this.collections();
-    if (asked) return cols.find((c) => c.slug === asked) ?? null;
-    return cols.find((c) => c.slug === this.settings.defaultCollection) ?? cols[0] ?? null;
+  collections(): CollectionConfig[] {
+    try {
+      const col = getCollection("_superusers", this.http.collections);
+      return col.auth ? [col] : [];
+    } catch {
+      return []; // not served by this app
+    }
+  }
+
+  /** The collection every request signs in against (_superusers); null when the app does not serve it. */
+  authCollection(): CollectionConfig | null {
+    return this.collections()[0] ?? null;
   }
 
   staticClient(id: string): { client: OAuthClient; secretHash: Promise<string> } | null {
@@ -99,7 +87,6 @@ export class OAuthCtx {
         secretHash: "",
         created: "",
         lastUsed: "",
-        authCollection: c.authCollection,
       },
     };
   }

@@ -1,5 +1,5 @@
 import { assert, assertEquals, assertMatch, assertNotEquals, assertStringIncludes } from "@std/assert";
-import { connect, INITIALIZE, mt_users, rpc } from "../mcp/testkit.ts";
+import { connect, INITIALIZE, rpc } from "../mcp/testkit.ts";
 import { MemoryMailer } from "../auth/mailer.ts";
 import { tokenFor } from "../testing/mod.ts";
 import {
@@ -47,15 +47,15 @@ Deno.test("oauth e2e: discovery, DCR, login, consent, code + PKCE, MCP call, ref
   const signedIn = await b.post("/oauth/login", {
     txn,
     csrf: hidden(loginHtml, "csrf"),
-    collection: "mt_users",
-    email: "ana@x.io",
+    collection: "_superusers",
+    email: "su@x.io",
     password: "12345678",
   });
   assertEquals(signedIn.status, 303);
   assertMatch(b.cookie, /(^|; )denobase_oauth=/);
   const consent = await (await b.get(signedIn.headers.get("location")!)).text();
   assertStringIncludes(consent, "127.0.0.1:51000");
-  assertStringIncludes(consent, "ana@x.io");
+  assertStringIncludes(consent, "su@x.io");
   assertStringIncludes(consent, RESOURCE.replace("http://", ""));
   // Loopback: any port, same path (RFC 8252); the answer carries state and iss (RFC 9207), delivered by the final page.
   const back = await b.post("/oauth/consent", { txn, csrf: hidden(consent, "csrf"), action: "allow" });
@@ -87,7 +87,7 @@ Deno.test("oauth e2e: discovery, DCR, login, consent, code + PKCE, MCP call, ref
   // The admin sees the grant and revokes it: the next /api/mcp call is 401 and the refresh is dead.
   const grants = await (await admin(app, t.suSession, "GET", "/api/oauth/grants")).json();
   assertEquals(grants.items.map((g: { email: string; clientName: string }) => [g.email, g.clientName]), [
-    ["ana@x.io", "Test client"],
+    ["su@x.io", "Test client"],
   ]);
   assertEquals((await admin(app, t.suSession, "DELETE", `/api/oauth/grants/${grants.items[0].id}`)).status, 204);
   const after = await rpc(app, INITIALIZE, { Authorization: `Bearer ${r1.body.access_token}` });
@@ -113,8 +113,8 @@ Deno.test("oauth e2e: a second authorization skips the remembered consent; promp
   await b.post("/oauth/login", {
     txn,
     csrf: hidden(login, "csrf"),
-    collection: "mt_users",
-    email: "ana@x.io",
+    collection: "_superusers",
+    email: "su@x.io",
     password: "12345678",
   });
   const consent = await (await b.get(`/oauth/authorize?txn=${txn}`)).text();
@@ -155,34 +155,25 @@ Deno.test("oauth e2e: Deny answers access_denied with state and iss", async () =
   assertEquals(u.searchParams.get("code"), null);
 });
 
-Deno.test("oauth e2e: OTP login on a collection with OTP enabled", async () => {
+Deno.test("oauth e2e: OTP login for a superuser (_superusers ships with OTP on)", async () => {
   const mailer = new MemoryMailer();
-  const t = await oauthFixture({ collections: ["mt_users"] }, { mailer });
-  // mt_users has no OTP config in the shared fixture: turn it on for this test only.
-  const users = mt_users as { auth: unknown };
-  const prev = users.auth;
-  users.auth = { otp: { enabled: true } };
-  try {
-    const b = new Browser(t.app);
-    const page = await (await b.get(authorizeQuery(t.clientId))).text();
-    assertStringIncludes(page, 'action="/oauth/otp/request"');
-    const [txn, csrf] = [hidden(page, "txn"), hidden(page, "csrf")];
-    const sent = await (await b.post("/oauth/otp/request", { txn, csrf, email: "ana@x.io" }))
-      .text();
-    const otpId = hidden(sent, "otpId");
-    const mail = mailer.sent.at(-1)!;
-    const code = (mail.text ?? mail.html ?? "").match(/\b(\d{8})\b/)![1];
-    const res = await b.post("/oauth/otp/verify", { txn, csrf, otpId, code });
-    assertEquals(res.status, 303);
-    assertStringIncludes(await (await b.get(res.headers.get("location")!)).text(), 'value="allow"');
-  } finally {
-    users.auth = prev;
-  }
+  const t = await oauthFixture({}, { mailer });
+  const b = new Browser(t.app);
+  const page = await (await b.get(authorizeQuery(t.clientId))).text();
+  assertStringIncludes(page, 'action="/oauth/otp/request"');
+  const [txn, csrf] = [hidden(page, "txn"), hidden(page, "csrf")];
+  const sent = await (await b.post("/oauth/otp/request", { txn, csrf, email: "su@x.io" })).text();
+  const otpId = hidden(sent, "otpId");
+  const mail = mailer.sent.at(-1)!;
+  const code = (mail.text ?? mail.html ?? "").match(/\b(\d{8})\b/)![1];
+  const res = await b.post("/oauth/otp/verify", { txn, csrf, otpId, code });
+  assertEquals(res.status, 303);
+  assertStringIncludes(await (await b.get(res.headers.get("location")!)).text(), 'value="allow"');
 });
 
-Deno.test("oauth e2e: a superuser authorizes when the request names auth_collection=_superusers", async () => {
+Deno.test("oauth e2e: a superuser authorizes and reaches the admin tools", async () => {
   const t = await oauthFixture();
-  const tk = await tokens(t, { email: "su@x.io", collection: "_superusers" });
+  const tk = await tokens(t, { email: "su@x.io" });
   const c = await connect(t.app, tk.access_token);
   assert((await c.listTools()).tools.some((x) => x.name === "db_sql"));
   await c.close();
@@ -220,7 +211,7 @@ Deno.test("oauth e2e: CIMD client (https client_id) resolved through a mocked fe
 
 Deno.test("oauth e2e: the SPA's session token is refused on /api/mcp and the OAuth token is a guest on REST", async () => {
   const t = await oauthFixture();
-  assertEquals((await rpc(t.app, INITIALIZE, { Authorization: t.anaSession })).status, 401);
+  assertEquals((await rpc(t.app, INITIALIZE, { Authorization: t.suSession })).status, 401);
   const tk = await tokens(t);
   const list = await t.app.fetch(
     new Request("http://localhost/api/collections/mt_notas/records", {
@@ -228,13 +219,13 @@ Deno.test("oauth e2e: the SPA's session token is refused on /api/mcp and the OAu
     }),
   );
   assertEquals((await list.json()).items.length, 0);
-  // While Ana's own session sees her note.
+  // While the superuser's own session sees every note.
   const own = await t.app.fetch(
     new Request("http://localhost/api/collections/mt_notas/records", {
-      headers: { Authorization: await tokenFor(t.app.db, "mt_users", t.ana) },
+      headers: { Authorization: await tokenFor(t.app.db, "_superusers", t.su) },
     }),
   );
-  assertEquals((await own.json()).items.length, 1);
+  assertEquals((await own.json()).items.length, 2);
 });
 
 Deno.test("oauth e2e: DCR rejects bad redirect URIs and hands a secret only to confidential clients", async () => {

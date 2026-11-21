@@ -6,6 +6,8 @@ import { badRequest } from "../core/errors.ts";
 import type { AttrValue, SpanEvent, SpanRecord } from "./span.ts";
 import { deleteInBatches, deleteOldestInBatches } from "../cron/tasks/batched_delete.ts";
 import type { Page } from "../logs/mod.ts";
+import { histIndex, histQuantile } from "./histogram.ts";
+import { ADMIN_UI_ATTR } from "./instrument/http.ts";
 
 /** _spans read like a collection, as _logs is, so PB filter/sort compile against it (attributes.* included). */
 const SPANS: CollectionConfig = {
@@ -24,6 +26,12 @@ const SPANS: CollectionConfig = {
     { name: "events", type: "json" },
   ],
 };
+
+/** A request's root ("GET /api/..."): the slowest routes leave out cron runs, workers and other roots. */
+const HTTP_ROOT = /^[A-Z]+ \//;
+
+/** A PB filter over any span of the trace, alone or with the period its root must start in (a PB date). */
+export type TraceQuery = string | { filter?: string; since?: string };
 
 /** A flat OTel-style attribute name, the only shape stats?groupBy=attribute takes. */
 const ATTR_KEY = /^[a-z0-9_]+(\.[a-z0-9_]+)*$/i;
@@ -100,10 +108,77 @@ function toSpan(r: Record<string, unknown>): StoredSpan {
   };
 }
 
-/** Root rows carry the trace's figures; count and errors come from its spans by the traceId index. */
-const SUMMARY_SELECT = `SELECT "_spans".*,
-  (SELECT COUNT(*) FROM "_spans" s WHERE s."traceId" = "_spans"."traceId") AS "spanCount",
-  (SELECT COUNT(*) FROM "_spans" s WHERE s."traceId" = "_spans"."traceId" AND s."status" = 2) AS "errorCount"`;
+function toSummary(r: Record<string, unknown>): TraceSummary {
+  const s = toSpan(r);
+  return {
+    traceId: s.traceId,
+    id: s.id,
+    name: s.name,
+    kind: s.kind,
+    status: s.status,
+    start: s.start,
+    duration: s.duration,
+    created: s.created,
+    attributes: s.attributes,
+    spanCount: Number(r.spanCount),
+    errorCount: Number(r.errorCount),
+  };
+}
+
+/** Count, failures and nearest-rank p50/p95 of a set of root durations. */
+export interface TraceFigures {
+  total: number;
+  errors: number;
+  p50: number;
+  p95: number;
+}
+
+export interface TraceOverview {
+  current: TraceFigures;
+  previous: TraceFigures;
+  hours: (TraceFigures & { date: string })[];
+  routes: (TraceFigures & { name: string })[];
+  /** Failed cron runs (roots named `cron <id>`) of each half, and per hour of the current one. */
+  cronFailed: { current: number; previous: number; hours: { date: string; failed: number }[] };
+}
+
+type Rollup = { hour: string; name: string; total: number; errors: number; hist: Record<number, number> };
+function roll(acc: Map<string, Rollup>, hour: string, name: string, status: number, ms: number) {
+  const key = `${hour}\u0000${name}`;
+  let r = acc.get(key);
+  if (!r) acc.set(key, r = { hour, name, total: 0, errors: 0, hist: {} });
+  r.total++;
+  if (Number(status) === 2) r.errors++;
+  const k = histIndex(Number(ms));
+  r.hist[k] = (r.hist[k] ?? 0) + 1;
+}
+
+type HBucket = { total: number; errors: number; hist: Map<number, number> };
+const hbucket = (): HBucket => ({ total: 0, errors: 0, hist: new Map() });
+function hmerge(b: HBucket, r: { total: number; errors: number }, hist: Record<string, number>) {
+  b.total += Number(r.total);
+  b.errors += Number(r.errors);
+  for (const [k, n] of Object.entries(hist)) b.hist.set(Number(k), (b.hist.get(Number(k)) ?? 0) + n);
+}
+function hfigures(b: HBucket): TraceFigures {
+  return {
+    total: b.total,
+    errors: b.errors,
+    p50: histQuantile(b.hist, b.total, 0.5) ?? 0,
+    p95: histQuantile(b.hist, b.total, 0.95) ?? 0,
+  };
+}
+
+/**
+ * The page's roots first, then each one's count and errors from its own spans: the counts run only for the rows
+ * returned, never for every matching root before ORDER BY/LIMIT. Both read the traceId index (`+status` keeps the
+ * planner off idx_spans_status_created, which made one subquery scan every failed span per root).
+ */
+const summarySql = (where: string, order: string) =>
+  `SELECT p.*,
+    (SELECT COUNT(*) FROM "_spans" s WHERE s."traceId" = p."traceId") AS "spanCount",
+    (SELECT COUNT(*) FROM "_spans" s WHERE s."traceId" = p."traceId" AND +s."status" = 2) AS "errorCount"
+  FROM (SELECT "_spans".* FROM "_spans" WHERE ${where} ${order} LIMIT ? OFFSET ?) p`;
 
 /**
  * Spans in the auxiliary db, next to _logs (PB keeps observability apart from the data so it never contends with
@@ -120,9 +195,62 @@ export class Spans {
       CREATE INDEX IF NOT EXISTS idx_spans_trace ON _spans ("traceId");
       DROP INDEX IF EXISTS idx_spans_root_created;
       CREATE INDEX IF NOT EXISTS idx_spans_root_created_duration ON _spans (root, created, duration);
-      CREATE INDEX IF NOT EXISTS idx_spans_name ON _spans (name);
+      DROP INDEX IF EXISTS idx_spans_name;
+      CREATE INDEX IF NOT EXISTS idx_spans_name_created ON _spans (name, created);
       CREATE INDEX IF NOT EXISTS idx_spans_created ON _spans (created);
       CREATE INDEX IF NOT EXISTS idx_spans_status_created ON _spans (status, created);`);
+    this.#ensureRollup();
+  }
+
+  /**
+   * _spans_hourly holds, per hour and root name, the count, the failures and a log-scale histogram of the durations:
+   * what the admin home reads, so its figures cost a few hundred small rows instead of a pass over a day of roots
+   * (seconds at a million spans, with the event loop blocked). Built once from the stored roots when it is new.
+   */
+  #ensureRollup(): void {
+    if (this.db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_spans_hourly'`).get()) return;
+    const own = !this.db.isTransaction;
+    if (own) this.db.exec("BEGIN IMMEDIATE");
+    try {
+      // Another connection (the job worker) may have built it while this one waited for the lock.
+      if (!this.db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_spans_hourly'`).get()) {
+        this.db.exec(`CREATE TABLE _spans_hourly (hour TEXT NOT NULL, name TEXT NOT NULL, total INTEGER NOT NULL,
+          errors INTEGER NOT NULL, hist TEXT NOT NULL, PRIMARY KEY (hour, name)) WITHOUT ROWID`);
+        const roots = this.db.prepare(
+          `SELECT created, name, status, duration FROM "_spans"
+           WHERE root = 1 AND json_extract(attributes, '$."${ADMIN_UI_ATTR}"') IS NULL`,
+        );
+        const acc = new Map<string, Rollup>();
+        for (const r of roots.iterate() as Iterable<Record<string, unknown>>) {
+          roll(acc, String(r.created).slice(0, 13), String(r.name), Number(r.status), Number(r.duration));
+        }
+        this.#mergeRollup(acc);
+      }
+      if (own) this.db.exec("COMMIT");
+    } catch (e) {
+      if (own) this.db.exec("ROLLBACK");
+      throw e;
+    }
+  }
+
+  /** Adds hour/name partials onto the stored rows (inside the caller's transaction). */
+  #mergeRollup(acc: Map<string, Rollup>): void {
+    if (!acc.size) return;
+    const get = this.db.prepare(`SELECT total, errors, hist FROM _spans_hourly WHERE hour = ? AND name = ?`);
+    const put = this.db.prepare(
+      `INSERT OR REPLACE INTO _spans_hourly (hour, name, total, errors, hist) VALUES (?, ?, ?, ?, ?)`,
+    );
+    for (const r of acc.values()) {
+      const old = get.get(r.hour, r.name) as { total: number; errors: number; hist: string } | undefined;
+      if (old) {
+        r.total += Number(old.total);
+        r.errors += Number(old.errors);
+        for (const [k, n] of Object.entries(parse(old.hist, {}) as Record<string, number>)) {
+          r.hist[Number(k)] = (r.hist[Number(k)] ?? 0) + n;
+        }
+      }
+      put.run(r.hour, r.name, r.total, r.errors, JSON.stringify(r.hist));
+    }
   }
 
   /** Whole traces in one transaction: rootName is copied onto every span so a filter on it finds the children. */
@@ -135,10 +263,15 @@ export class Spans {
        "rootName", attributes, events, created, updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const own = !this.db.isTransaction;
+    const acc = new Map<string, Rollup>();
     if (own) this.db.exec("BEGIN");
     try {
       for (const s of spans) {
         const created = stamp(new Date(Math.floor(s.start / 1000)));
+        // The admin UI's own requests stay out of the home's figures (ADMIN_UI_ATTR, set by the HTTP middleware).
+        if (s.root && !s.attributes?.[ADMIN_UI_ATTR]) {
+          roll(acc, created.slice(0, 13), s.name.slice(0, 500), s.status, s.duration);
+        }
         stmt.run(
           s.id,
           s.traceId,
@@ -156,6 +289,7 @@ export class Spans {
           created,
         );
       }
+      this.#mergeRollup(acc);
       if (own) this.db.exec("COMMIT");
     } catch (e) {
       if (own) this.db.exec("ROLLBACK");
@@ -176,46 +310,46 @@ export class Spans {
     }
   }
 
-  /** Roots of the traces that hold at least one span matching filter (a filter on children finds their trace). */
-  #roots(filter?: string): { sql: string; params: SQLInputValue[] } {
+  /**
+   * Roots of the traces that hold at least one span matching filter (a filter on children finds their trace), and
+   * that started at or after `since`. The period goes on the roots themselves, by the (root, created) index: sent as
+   * a created filter it took the any-span subquery over every span of the period (a second for a busy day).
+   */
+  #roots(q: TraceQuery = {}): { sql: string; params: SQLInputValue[] } {
+    const { filter, since } = typeof q === "string" ? { filter: q, since: undefined } : q;
     const pb = this.#compile(filter);
-    if (!pb.where) return { sql: `"_spans"."root" = 1`, params: [] };
+    const params: SQLInputValue[] = [];
+    let sql = `"_spans"."root" = 1`;
+    if (since) {
+      sql += ` AND "_spans"."created" >= ?`;
+      params.push(since);
+    }
+    if (!pb.where) return { sql, params };
+    // Children start after their root, so the subquery can skip what came before the period too.
+    const period = since ? ` AND "_spans"."created" >= ?` : "";
     return {
-      sql: `"_spans"."root" = 1 AND "_spans"."traceId" IN (SELECT "_spans"."traceId" FROM "_spans" ${
+      sql: `${sql} AND "_spans"."traceId" IN (SELECT "_spans"."traceId" FROM "_spans" ${
         pb.joins.join(" ")
-      } WHERE ${pb.where})`,
-      params: [...pb.joinParams, ...pb.params] as SQLInputValue[],
+      } WHERE (${pb.where})${period})`,
+      params: [...params, ...pb.joinParams, ...pb.params, ...(since ? [since] : [])] as SQLInputValue[],
     };
   }
 
   /** PB search shape over traces: {page, perPage, totalItems, totalPages, items}; newest first by default. */
-  listTraces(q: { filter?: string; sort?: string; page?: number; perPage?: number } = {}): Page<TraceSummary> {
+  listTraces(
+    q: { filter?: string; since?: string; sort?: string; page?: number; perPage?: number } = {},
+  ): Page<TraceSummary> {
     const page = q.page && q.page > 0 ? q.page : 1;
     const perPage = Math.min(q.perPage && q.perPage > 0 ? q.perPage : 30, 500);
-    const where = this.#roots(q.filter);
+    const where = this.#roots({ filter: q.filter, since: q.since });
     const order = this.#compile(undefined, q.sort || "-start").orderBy;
     const totalItems = Number(
       (this.db.prepare(`SELECT COUNT(*) AS n FROM "_spans" WHERE ${where.sql}`).get(...where.params) as { n: number })
         .n,
     );
-    const rows = this.db.prepare(`${SUMMARY_SELECT} FROM "_spans" WHERE ${where.sql} ${order} LIMIT ? OFFSET ?`)
+    const rows = this.db.prepare(summarySql(where.sql, order))
       .all(...where.params, perPage, (page - 1) * perPage) as Record<string, unknown>[];
-    const items: TraceSummary[] = rows.map((r) => {
-      const s = toSpan(r);
-      return {
-        traceId: s.traceId,
-        id: s.id,
-        name: s.name,
-        kind: s.kind,
-        status: s.status,
-        start: s.start,
-        duration: s.duration,
-        created: s.created,
-        attributes: s.attributes,
-        spanCount: Number(r.spanCount),
-        errorCount: Number(r.errorCount),
-      };
-    });
+    const items = rows.map(toSummary);
     return { page, perPage, totalItems, totalPages: Math.ceil(totalItems / perPage), items };
   }
 
@@ -247,7 +381,7 @@ export class Spans {
    * Traces per hour with errors and nearest-rank duration percentiles of their roots, computed in SQL by a window
    * ordered by duration inside each hour.
    */
-  stats(filter?: string): TraceStats[] {
+  stats(filter?: TraceQuery): TraceStats[] {
     const where = this.#roots(filter);
     const hour = `strftime('%Y-%m-%d %H:00:00', "_spans"."created")`;
     const rows = this.db.prepare(
@@ -272,7 +406,7 @@ export class Spans {
   }
 
   /** Whole-period figures of the roots (stats?groupBy=total): real percentiles, not the worst hourly ones. */
-  overall(filter?: string): { total: number; errors: number; p50: number; p95: number; p99: number } {
+  overall(filter?: TraceQuery): { total: number; errors: number; p50: number; p95: number; p99: number } {
     const where = this.#roots(filter);
     const r = this.db.prepare(
       `WITH r AS (SELECT "_spans".duration AS d, "_spans".status AS st,
@@ -294,7 +428,10 @@ export class Spans {
   }
 
   /** The slowest root names by p95 (stats?groupBy=name). */
-  slowest(filter?: string, limit = 10): { name: string; total: number; errors: number; p50: number; p95: number }[] {
+  slowest(
+    filter?: TraceQuery,
+    limit = 10,
+  ): { name: string; total: number; errors: number; p50: number; p95: number }[] {
     const where = this.#roots(filter);
     const rows = this.db.prepare(
       `WITH r AS (SELECT "_spans".name AS name, "_spans".duration AS d, "_spans".status AS st,
@@ -321,7 +458,7 @@ export class Spans {
    */
   byAttribute(
     key: string,
-    filter?: string,
+    filter?: TraceQuery,
     limit = 50,
   ): { value: AttrValue; total: number; errors: number; p50: number; p95: number }[] {
     if (!ATTR_KEY.test(key)) throw badRequest("Invalid attribute key.");
@@ -346,34 +483,90 @@ export class Spans {
     }));
   }
 
-  /** Dashboard figures: traces, failed traces and root p95 since `since`. */
-  summary(since: Date): { count: number; errors: number; p95: number } {
-    const from = stamp(since);
-    const agg = this.db.prepare(
-      `SELECT COUNT(*) AS n, COALESCE(SUM(status = 2), 0) AS e FROM "_spans" WHERE root = 1 AND created >= ?`,
-    ).get(from) as { n: number; e: number };
-    const n = Number(agg.n);
-    // Nearest rank by index: one row read, not the day's durations.
-    const p95 = n
-      ? (this.db.prepare(
-        `SELECT duration FROM "_spans" WHERE root = 1 AND created >= ? ORDER BY duration LIMIT 1 OFFSET ?`,
-      ).get(from, Math.max(0, Math.ceil(0.95 * n) - 1)) as { duration: number }).duration
-      : 0;
-    return { count: n, errors: Number(agg.e), p95: Number(p95) };
+  /**
+   * The admin home's trace figures from _spans_hourly: per hour, per half (the last `hours` against the ones before,
+   * for the deltas) and the slowest request routes of the current half. Percentiles come from the histogram buckets
+   * (each about 10% wide), which is precision enough for a dashboard and keeps this a read of a few hundred rows.
+   * Routes rank only with at least `minRoute` traces: a route seen 4 times has no p95 worth ranking.
+   */
+  overview(now: Date, hours = 24, minRoute = 20): TraceOverview {
+    const hourOf = (d: Date) => stamp(d).slice(0, 13);
+    const mid = hourOf(new Date(now.getTime() - (hours - 1) * 36e5));
+    const from = hourOf(new Date(now.getTime() - (2 * hours - 1) * 36e5));
+    const rows = this.db.prepare(`SELECT hour, name, total, errors, hist FROM _spans_hourly WHERE hour >= ?`)
+      .all(from) as { hour: string; name: string; total: number; errors: number; hist: string }[];
+    const cur = hbucket(), prev = hbucket(), byHour = new Map<string, HBucket>(), byName = new Map<string, HBucket>();
+    const cronFailed = { current: 0, previous: 0, hours: new Map<string, number>() };
+    for (const r of rows) {
+      const hist = parse(r.hist, {}) as Record<string, number>;
+      const cronErrors = r.name.startsWith("cron ") ? Number(r.errors) : 0;
+      if (r.hour < mid) {
+        hmerge(prev, r, hist);
+        cronFailed.previous += cronErrors;
+        continue;
+      }
+      if (cronErrors) {
+        cronFailed.current += cronErrors;
+        cronFailed.hours.set(r.hour, (cronFailed.hours.get(r.hour) ?? 0) + cronErrors);
+      }
+      hmerge(cur, r, hist);
+      hmerge(byHour.get(r.hour) ?? byHour.set(r.hour, hbucket()).get(r.hour)!, r, hist);
+      hmerge(byName.get(r.name) ?? byName.set(r.name, hbucket()).get(r.name)!, r, hist);
+    }
+    return {
+      current: hfigures(cur),
+      previous: hfigures(prev),
+      hours: [...byHour.entries()].sort(([a], [b]) => (a < b ? -1 : 1))
+        .map(([h, b]) => ({ date: `${h}:00:00.000Z`, ...hfigures(b) })),
+      routes: [...byName.entries()].filter(([name, b]) => HTTP_ROOT.test(name) && b.total >= minRoute)
+        .map(([name, b]) => ({ name, ...hfigures(b) }))
+        .sort((a, b) => b.p95 - a.p95).slice(0, 5),
+      cronFailed: {
+        current: cronFailed.current,
+        previous: cronFailed.previous,
+        hours: [...cronFailed.hours.entries()].map(([h, n]) => ({ date: `${h}:00:00.000Z`, failed: n })),
+      },
+    };
+  }
+
+  /**
+   * The newest failed or slow roots since `since`, newest first, read backwards along the (root, created) index.
+   * denobase's own maintenance crons (`cron __x__`) count only when they failed: their slowness is the job worker
+   * waiting on a WAL checkpoint, and every tick of it would push the app's real problems off the list.
+   */
+  problems(since: Date, slowMs: number, limit = 6): TraceSummary[] {
+    // Slow alone is not an issue for denobase's own maintenance crons nor for the admin UI's calls (a busy disk makes
+    // them slow and the panel would list itself); their failures still are.
+    const where = `"_spans".root = 1 AND "_spans".created >= ? AND ("_spans".status = 2 OR ("_spans".duration >= ?
+      AND "_spans".name NOT LIKE 'cron \\_\\_%' ESCAPE '\\'
+      AND json_extract("_spans".attributes, '$."${ADMIN_UI_ATTR}"') IS NULL))`;
+    const rows = this.db.prepare(summarySql(where, `ORDER BY "_spans".created DESC`))
+      .all(stamp(since), slowMs > 0 ? slowMs : 1e15, limit, 0) as Record<string, unknown>[];
+    return rows.map(toSummary);
   }
 
   truncate(): void {
-    this.db.exec(`DELETE FROM _spans`);
+    this.db.exec(`DELETE FROM _spans; DELETE FROM _spans_hourly`);
   }
 
   /** Run by the __denobaseTracesCleanup__ job, in batches that release the write lock between them. */
   async deleteOlderThan(date: Date): Promise<void> {
     await deleteInBatches(this.db, "_spans", "created <= ?", [stamp(date)]);
+    this.#dropHoursBefore(stamp(date).slice(0, 13));
+  }
+
+  /** Hours wholly before the oldest kept span leave the rollup with it (the partial hour stays until it goes). */
+  #dropHoursBefore(hour: string): void {
+    this.db.prepare(`DELETE FROM _spans_hourly WHERE hour < ?`).run(hour);
   }
 
   /** Keeps at most maxRows spans, deleting the oldest in batches (the cleanup job's size cap). */
   async trimTo(maxRows: number): Promise<void> {
     const n = Number((this.db.prepare(`SELECT COUNT(*) AS n FROM _spans`).get() as { n: number }).n);
-    if (n > maxRows) await deleteOldestInBatches(this.db, "_spans", "created, rowid", n - maxRows);
+    if (n > maxRows) {
+      await deleteOldestInBatches(this.db, "_spans", "created, rowid", n - maxRows);
+      const oldest = this.db.prepare(`SELECT MIN(created) AS c FROM _spans`).get() as { c: string | null };
+      if (oldest.c) this.#dropHoursBefore(oldest.c.slice(0, 13));
+    }
   }
 }

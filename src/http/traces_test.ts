@@ -108,11 +108,16 @@ Deno.test("traces API: list, filter, view with logs, stats, truncate; reading ne
   assertEquals(grouped404.json.map((g: { value: number }) => g.value), [404]);
   assertEquals((await t.call("GET", "/api/traces/stats?groupBy=attribute&key=a')--")).status, 400);
 
-  const dash = await t.call("GET", "/api/_denobase/stats");
-  assertEquals([dash.json.traces.count24h, dash.json.traces.errors24h], [2, 0]);
+  const dash = await t.call("GET", "/api/_denobase/traces");
+  assertEquals([dash.json.current.total, dash.json.current.errors], [2, 0]);
+  assertEquals((await t.call("GET", "/api/_denobase/traffic")).status, 200);
 
   t.app.tracer.flush();
-  assertEquals(t.app.traces.listTraces().totalItems, 2, "the traces API and stats did not trace themselves");
+  assertEquals(
+    t.app.traces.listTraces().totalItems,
+    2,
+    "the traces API and the home's endpoints did not trace themselves",
+  );
   assertEquals((await t.call("DELETE", "/api/traces")).status, 204);
   assertEquals((await t.call("GET", "/api/traces")).json.totalItems, 0);
 });
