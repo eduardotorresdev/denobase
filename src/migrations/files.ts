@@ -47,7 +47,7 @@ async function writeMigration(m: Migration, dir: URL): Promise<void> {
 export async function create(cs: CollectionConfig[], dir: URL = MIGRATIONS_DIR): Promise<Migration | null> {
   const ms = await loadMigrations(dir);
   refuseMultipleHeads(ms);
-  const ops = diff(replay(ms), configToSnapshot(cs));
+  const ops = diff(replay(ms), configToSnapshot(cs), renamesOf(cs));
   if (!ops.length) return null;
   const m: Migration = { id: newMigrationId(), parents: heads(ms), ops };
   await writeMigration(m, dir);
@@ -64,7 +64,11 @@ export async function reconcile(cs: CollectionConfig[], dir: URL = MIGRATIONS_DI
     return null;
   }
   // A merge is written even with no ops: its only job may be joining the heads.
-  const m: Migration = { id: newMigrationId(), parents: hs, ops: diff(replay(ms), configToSnapshot(cs)) };
+  const m: Migration = {
+    id: newMigrationId(),
+    parents: hs,
+    ops: diff(replay(ms), configToSnapshot(cs), renamesOf(cs)),
+  };
   await writeMigration(m, dir);
   await writeSnapshot(replay([...ms, m]), dir);
   return m;
@@ -73,4 +77,9 @@ export async function reconcile(cs: CollectionConfig[], dir: URL = MIGRATIONS_DI
 export async function writeSnapshot(s: Snapshot, dir: URL = MIGRATIONS_DIR): Promise<void> {
   await Deno.mkdir(dir, { recursive: true });
   await Deno.writeTextFile(new URL(SNAPSHOT_FILE, dir), JSON.stringify(s, null, 2) + "\n");
+}
+
+/** New slug -> old slug for every collection declaring renamedFrom. */
+export function renamesOf(cs: CollectionConfig[]): Record<string, string> {
+  return Object.fromEntries(cs.filter((c) => c.renamedFrom).map((c) => [c.slug, c.renamedFrom!]));
 }

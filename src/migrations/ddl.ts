@@ -44,6 +44,8 @@ export function opToSql(op: MigrationOp, before: Snapshot): string[] {
       const t = collectionToTable(op.collection);
       return [createTableSql(t), ...t.indexes.map((i) => createIndexSql(t.name, i))];
     }
+    case "renameCollection":
+      return [`ALTER TABLE ${quoteIdent(tableName(op.from))} RENAME TO ${quoteIdent(tableName(op.to))}`];
     case "dropCollection":
       return [`DROP TABLE ${quoteIdent(tableName(op.slug))}`];
     case "addField": {

@@ -48,7 +48,8 @@ export function collectionType(c: CollectionConfig): "base" | "auth" | "view" {
 
 /** PB's id for a collection created without one: "pbc_" + crc32(type + name); _superusers is pbc_3142635823. */
 export function collectionId(c: CollectionConfig): string {
-  const key = collectionType(c) + c.slug;
+  // shortcut: only one rename level keeps the original id; a second rename must keep the first renamedFrom's id.
+  const key = collectionType(c) + (c.renamedFrom ?? c.slug);
   let id = collectionIds.get(key);
   if (id === undefined) collectionIds.set(key, id = `pbc_${crc32(key)}`);
   return id;

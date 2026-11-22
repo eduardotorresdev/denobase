@@ -4,8 +4,15 @@ import { canon, clone, indexesByName } from "./snapshot.ts";
 /** Pure snapshot algebra: the ops between two snapshots and applying ops to one. */
 
 /** Pure: ops turning `from` into `to`. */
-export function diff(from: Snapshot, to: Snapshot): MigrationOp[] {
+export function diff(from: Snapshot, to: Snapshot, renames: Record<string, string> = {}): MigrationOp[] {
   const ops: MigrationOp[] = [];
+  // Renames first (new slug -> old slug), so the fields below diff against the kept table instead of a fresh one.
+  for (const [slug, old] of Object.entries(renames)) {
+    if (to[slug] && !to[slug].view && from[old] && !from[old].view && !from[slug] && !to[old]) {
+      ops.push({ op: "renameCollection", from: old, to: slug });
+    }
+  }
+  if (ops.length) from = applyOps(from, ops);
   for (const slug of Object.keys(from)) if (!to[slug]) ops.push({ op: "dropCollection", slug });
   for (const [slug, t] of Object.entries(to)) {
     const f = from[slug];
@@ -59,6 +66,11 @@ export function applyOps(s: Snapshot, ops: MigrationOp[]): Snapshot {
         need(out, o.slug);
         delete out[o.slug];
         break;
+      case "renameCollection":
+        if (out[o.to]) throw new Error(`collection already exists: ${o.to}`);
+        out[o.to] = { ...need(out, o.from), slug: o.to };
+        delete out[o.from];
+        break;
       case "addField": {
         const c = need(out, o.slug);
         if (c.fields.some((f) => f.name === o.field.name)) throw new Error(`field exists: ${o.slug}.${o.field.name}`);
@@ -110,6 +122,9 @@ export function applyOpsLenient(s: Snapshot, ops: MigrationOp[]): Snapshot {
       case "dropCollection":
         delete out[o.slug];
         break;
+      case "renameCollection":
+        if (has(o.from) && !has(o.to)) out = applyOps(out, [o]);
+        break;
       case "addField":
       case "alterField":
         if (!has(o.slug)) throw new Error(`unknown collection in migration: ${o.slug}`);
@@ -136,5 +151,6 @@ export function applyOpsLenient(s: Snapshot, ops: MigrationOp[]): Snapshot {
 
 /** Strict ops that move `s` to where the (possibly overlapping) op leaves it; [] when it is already there. */
 export function normalizeOp(s: Snapshot, op: MigrationOp): MigrationOp[] {
+  if (op.op === "renameCollection") return s[op.from] && !s[op.to] ? [op] : [];
   return diff(s, applyOpsLenient(s, [op]));
 }

@@ -23,7 +23,7 @@ import type {
   McpToolDef,
 } from "./types.ts";
 
-export const SERVER_INFO = { name: "denobase", version: "0.4.1" };
+export const SERVER_INFO = { name: "denobase", version: "0.5.0" };
 
 const INSTRUCTIONS = "denobase (PocketBase on Deno). Tools run as the authenticated principal: collection access " +
   "rules apply exactly as on the REST API. Start with the collections tool and the schema:// resources.";

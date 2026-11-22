@@ -16,6 +16,7 @@ export type Snapshot = Record<string, CollectionSnapshot>;
 export type MigrationOp =
   | { op: "createCollection"; collection: CollectionSnapshot }
   | { op: "dropCollection"; slug: string }
+  | { op: "renameCollection"; from: string; to: string }
   | { op: "addField"; slug: string; field: CollectionSnapshot["fields"][number] }
   | { op: "removeField"; slug: string; name: string }
   | { op: "alterField"; slug: string; field: CollectionSnapshot["fields"][number] }

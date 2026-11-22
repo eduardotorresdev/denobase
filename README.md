@@ -15,7 +15,7 @@ deno add jsr:@denobase/denobase
 Import it under the bare key `denobase` (what `deno add` writes to your `deno.json`):
 
 ```json
-{ "imports": { "denobase": "jsr:@denobase/denobase@^0.4.1" } }
+{ "imports": { "denobase": "jsr:@denobase/denobase@^0.5.0" } }
 ```
 
 ## Usage
@@ -48,6 +48,10 @@ Deno.exit(await cli.run(Deno.args));
 deno run -A main.ts migrate create   # writes a migration diffed from the declared collections
 deno run -A main.ts serve --port 8090
 ```
+
+To rename a collection, change its `slug` and set `renamedFrom: "<old slug>"`: `migrate create` then emits a table
+rename instead of drop + create, so rows, files and tokens survive. Keep `renamedFrom` in the declaration afterwards,
+because the collectionId (and with it the file paths) is still derived from the old name.
 
 `serve` applies pending migrations, keeps its data in `pb_data/` and serves the API at `http://localhost:8090/api/` and
 the admin UI at `http://localhost:8090/_/`. `cli.add(command)` adds or replaces CLI commands; `createApp({ db })` builds

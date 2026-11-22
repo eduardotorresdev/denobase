@@ -176,6 +176,11 @@ export interface AuthConfig {
 
 export interface CollectionConfig {
   slug: string;
+  /**
+   * The slug this collection had before: the next migration renames its table instead of dropping it, and the
+   * collectionId (file paths, tokens) stays the old one. Keep it while any database or stored file predates it.
+   */
+  renamedFrom?: string;
   /** Auth collections get email, password hash, tokenKey and verified columns implicitly. */
   auth?: boolean | AuthConfig;
   fields: Field[];

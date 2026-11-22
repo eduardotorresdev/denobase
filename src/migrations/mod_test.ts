@@ -16,6 +16,8 @@ import {
   up,
 } from "./mod.ts";
 import { opToSql } from "./ddl.ts";
+import { renamesOf } from "./files.ts";
+import { collectionId } from "../core/registry.ts";
 import type { Snapshot } from "./types.ts";
 
 const cargos: CollectionConfig = {
@@ -177,4 +179,28 @@ Deno.test("addIndex keeps the partial index predicate", () => {
     before,
   );
   assertEquals(sql, ['CREATE UNIQUE INDEX "idx_t_a" ON "t" ("a") WHERE `a` != \'\'']);
+});
+
+Deno.test("renamedFrom renames the table, keeping rows and the relation pointing at it", async () => {
+  const db = memDb();
+  const m1: Migration = { id: "1", parents: [], ops: diff({}, configToSnapshot([cargos, users])) };
+  await up(db, [m1]);
+  db.prepare(`INSERT INTO cargos (id, created, updated, titulo) VALUES ('c1','t','t','Admin')`).run();
+  db.prepare(`INSERT INTO users (id, created, updated, email, passwordHash, tokenKey, cargo)
+    VALUES ('u1','t','t','a@b.c','h','k','c1')`).run();
+
+  const roles: CollectionConfig = { ...cargos, slug: "roles", renamedFrom: "cargos" };
+  const users2: CollectionConfig = {
+    ...users,
+    fields: [users.fields[0], { name: "cargo", type: "relationship", relationTo: "roles" }],
+  };
+  const ops = diff(replay([m1]), configToSnapshot([roles, users2]), renamesOf([roles, users2]));
+  assertEquals(ops[0], { op: "renameCollection", from: "cargos", to: "roles" });
+  assertEquals(ops.some((o) => o.op === "dropCollection"), false);
+  const m2: Migration = { id: "2", parents: ["1"], ops };
+  assertEquals(await up(db, [m1, m2]), ["2"]);
+  assertEquals(db.prepare(`SELECT titulo FROM roles`).get(), { titulo: "Admin" });
+  assertEquals(db.prepare(`SELECT cargo FROM users`).get(), { cargo: "c1" });
+  assertEquals(replay([m1, m2]), configToSnapshot([roles, users2]));
+  assertEquals(collectionId(roles), collectionId(cargos));
 });
